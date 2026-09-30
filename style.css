@@ -334,17 +334,20 @@ svg {
 .scroller {
   position: absolute;
   inset: 0;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  background: var(--paper);
+  background: #E4E7EB;   /* ページの外側。縮小したときにページの端が分かる */
+  touch-action: pan-x pan-y;
 }
 
 .sheet {
   position: relative;
+  margin: 0 auto;
   background: var(--paper);
-  touch-action: pan-y;   /* 指は縦スクロールだけ。ペンは editor.js 側でスクロールを止める */
+  box-shadow: 0 0 0 1px var(--line);
+  /* 指1本はスクロール。ピンチは editor.js で処理。ペンは editor.js 側でスクロールを止める */
+  touch-action: pan-x pan-y;
 }
 
 .tile {
@@ -483,7 +486,7 @@ svg {
   margin-right: 4px;
 }
 
-.color {
+.color, .mcolor {
   display: grid;
   place-items: center;
   width: 40px;
@@ -493,16 +496,71 @@ svg {
   background: none;
 }
 
-.color span {
+.color span, .mcolor span {
   width: 24px;
   height: 24px;
   border-radius: 50%;
   box-shadow: 0 0 0 2px var(--bg), 0 0 0 2px var(--bg);
 }
 
-.color[aria-pressed="true"] span {
+.color[aria-pressed="true"] span,
+.mcolor[aria-pressed="true"] span {
   box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--ink);
 }
+
+/* 色・太さの枠(幅を固定して、切り替えても右の道具ボタンが動かないようにする) */
+.palette {
+  display: flex;
+  align-items: center;
+  min-width: 248px;
+}
+
+.pal { display: flex; align-items: center; }
+.ed-bar[data-palette="pen"] .pal-marker,
+.ed-bar[data-palette="marker"] .pal-pen { display: none; }
+
+/* 消しゴム:選択中にもう一度タップすると種類を選べる(小さな▼で示す) */
+.tool-eraser { position: relative; }
+.tool-eraser[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 4px solid transparent;
+  border-top: 5px solid currentColor;
+}
+
+.eraser-menu {
+  position: fixed;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 240px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--paper);
+  box-shadow: 0 8px 24px rgba(31, 42, 58, .18);
+}
+
+.eraser-menu button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-height: 56px;
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  text-align: left;
+}
+
+.eraser-menu strong { font-size: 16px; }
+.eraser-menu span { font-size: 13px; color: var(--muted); }
+.eraser-menu button[aria-pressed="true"] { background: var(--bg); }
+.eraser-menu button[aria-pressed="true"] strong::after { content: "(使用中)"; font-weight: 400; font-size: 13px; color: var(--muted); }
 
 /* ペンの太さ */
 .widths {
@@ -737,7 +795,8 @@ svg {
 /* iPad mini 縦向きなど幅が狭いとき */
 @media (max-width: 760px) {
   .tool { min-width: 56px; }
-  .color, .width { width: 34px; }
+  .color, .mcolor, .width { width: 34px; }
+  .palette { min-width: 204px; }
   .pg-date { font-size: 15px; }
   .flag-item { flex-direction: column; align-items: stretch; }
   .flag-meta { width: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }

@@ -27,10 +27,27 @@ export function strokeBBox(pts, w) {
   return [x0 - pad, y0 - pad, x1 + pad, y1 + pad];
 }
 
+// 線の太さ。蛍光ペン(hl)は筆圧に関係なく一定。
+export function strokeWidth(s, pressure) {
+  return s.hl ? s.w : widthOf(s.w, pressure);
+}
+
 // 1本のストロークを描く。pts は [x, y, 筆圧, x, y, 筆圧, ...] の平坦な配列。
 // 点と点の中間点を通る2次曲線でつなぎ、角ばらない滑らかな線にする。
 // (書いている最中の表示 editor.js の drawLivePiece も同じ描き方にして、ペンを離したときに線が変化しないようにしている)
+// 蛍光ペンは「乗算」で重ねるので、下の罫線や文字が透けて見え、重ね塗りすると少し濃くなる。
 export function drawStroke(ctx, s, minW = 0) {
+  if (s.hl) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    drawPath(ctx, s, minW);
+    ctx.restore();
+  } else {
+    drawPath(ctx, s, minW);
+  }
+}
+
+function drawPath(ctx, s, minW) {
   const p = s.pts;
   const n = p.length / 3;
   const color = s.c || INK;   // 色が無い線(以前のメモ)は黒
@@ -38,7 +55,7 @@ export function drawStroke(ctx, s, minW = 0) {
   ctx.fillStyle = color;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  const W = (i) => Math.max(widthOf(s.w, p[i * 3 + 2]), minW);
+  const W = (i) => Math.max(strokeWidth(s, p[i * 3 + 2]), minW);
   if (n === 1) {
     ctx.beginPath();
     ctx.arc(p[0], p[1], W(0) / 2, 0, Math.PI * 2);
@@ -65,6 +82,18 @@ export function drawStroke(ctx, s, minW = 0) {
   }
   ctx.lineTo(p[(n - 1) * 3], p[(n - 1) * 3 + 1]);
   ctx.stroke();
+}
+
+// 矩形 [x0, y0, x1, y1] にかかる線を描く。蛍光ペンを先に描いて、文字の下に来るようにする。
+export function drawStrokesIn(ctx, strokes, x0, y0, x1, y1, minW = 0) {
+  for (const pass of [true, false]) {
+    for (const s of strokes) {
+      if (!!s.hl !== pass) continue;
+      const b = s.b;
+      if (b[2] < x0 || b[0] > x1 || b[3] < y0 || b[1] > y1) continue;
+      drawStroke(ctx, s, minW);
+    }
+  }
 }
 
 // 薄い罫線。y0〜y1(ページ座標)の範囲だけ描く。
@@ -96,10 +125,6 @@ export function renderRegion(note, rect, maxW, maxH, maxScale = Infinity) {
   ctx.fillRect(0, 0, c.width, c.height);
   ctx.setTransform(dpr * s, 0, 0, dpr * s, -dpr * s * rect.x, -dpr * s * rect.y);
   const minW = 0.9 / s; // 縮小しても線が消えないようにする
-  for (const st of note.strokes) {
-    const b = st.b;
-    if (b[2] < rect.x || b[0] > rect.x + rect.w || b[3] < rect.y || b[1] > rect.y + rect.h) continue;
-    drawStroke(ctx, st, minW);
-  }
+  drawStrokesIn(ctx, note.strokes, rect.x, rect.y, rect.x + rect.w, rect.y + rect.h, minW);
   return c;
 }

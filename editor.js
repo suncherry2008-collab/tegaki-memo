@@ -1,19 +1,23 @@
 // 手書き画面(1ページ分)。どのページを表示するかは app.js が決める。
 //
 // 入力の扱い:
-//   Apple Pencil(pen)・マウス → 書く / 消す / 囲む
-//   指(touch)                 → スクロールのみ(書かない)
+//   Apple Pencil(pen)・マウス → 書く / 蛍光ペン / 消す / 囲む
+//   指1本                      → スクロール
+//   指2本                      → ピンチで縮小・拡大(1ページ全体表示 〜 3倍)
 //
 // 描画の仕組み:
-//   1枚の巨大なcanvasは使わない(iPadのcanvasサイズ上限対策)。
-//   縦 TILE px ごとのcanvas(タイル)を、見えている付近だけ作って描く。
-//   書いている最中の線は画面に重ねた live canvas に描き、ペンを離した時点でタイルへ確定する。
+//   1枚の巨大なcanvasは使わない(iPadのcanvasサイズ・メモリ上限対策)。
+//   ページを TILE px 四方のマス目に分け、見えている付近のマスだけcanvasを作って描く。
+//   書いている最中の線は画面に重ねた live canvas に描き、ペンを離した時点でマスへ確定する。
 //   さらに predict canvas に「最後の点から先読みした位置まで」を仮に描き、ペンとの遅れを小さく見せる。
 
-import { PAGE_W, drawStroke, drawRuled, strokeBBox, widthOf } from './render.js';
+import { PAGE_W, drawStroke, drawStrokesIn, drawRuled, strokeBBox, strokeWidth } from './render.js';
 import { putPage } from './db.js';
 
-const TILE = 1024;                    // タイルの高さ(CSS px)
+const TILE = 512;                     // マス目の大きさ(CSS px)
+const MAX_ZOOM = 3;                   // 拡大の上限(等倍 = 画面の横幅にページがぴったり)
+const SNAP_ZOOM = 0.08;               // 等倍からこの範囲で指を離すと等倍に戻す
+const MARKER_W = 24;                  // 蛍光ペンの太さ(ページ座標)
 const ERASER_R = 12;                  // 消しゴムの半径(ページ座標)
 const MIN_FLAG_SIZE = 24;             // これより小さい囲みは無視する
 const PALM_RADIUS = 32;               // これより大きい接触は手のひらとみなす(px)
@@ -28,23 +32,30 @@ const PRESSURE_SMOOTH = 0.35;         // 筆圧のなめらかさ(小さいほ�
 const uid = () => (crypto.randomUUID ? crypto.randomUUID()
   : Date.now().toString(36) + Math.random().toString(36).slice(2));
 const r2 = (v) => Math.round(v * 100) / 100;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
 export function createEditor(els, { onChange, onError }) {
-  const { scroller, sheet, flagLayer, live, predict, undoBtn, hint,
-    toolButtons, colorButtons, widthButtons } = els;
+  const { toolbar, scroller, sheet, flagLayer, live, predict, undoBtn, hint,
+    toolButtons, colorButtons, widthButtons, markerButtons,
+    eraserMenu, eraserButtons, eraserLabel } = els;
   const liveCtx = live.getContext('2d', { desynchronized: true });
   const predCtx = predict.getContext('2d', { desynchronized: true });
 
   let page = null;
-  let scale = 1;
+  let zoom = 1;
+  let minZoom = 1;
+  let scale = 1;           // ページ座標 → CSS px
   let dpr = 1;
   let sheetW = 0;
   let sheetH = 0;
-  let tool = 'pen';
+  let tool = 'pen';        // pen / marker / eraser / flag
   let color = colorButtons[0].dataset.color;
+  let markerColor = markerButtons[0].dataset.color;
   let penW = Number(widthButtons.find((b) => b.getAttribute('aria-pressed') === 'true').dataset.width);
+  let eraserMode = 'partial'; // partial = こすった部分だけ / stroke = 線を1本まるごと
   let undoStack = [];
   let action = null;       // 書いている最中の操作
+  let pinch = null;        // ピンチ操作中の状態
   let dirty = false;
   let saveTimer = null;
   let penActive = false;
@@ -53,51 +64,69 @@ export function createEditor(els, { onChange, onError }) {
   let popEl = null;
   let pulseId = null;      // 目立たせるフラグ(一覧から開いたとき・囲んだ直後)
   let pulseTimer = null;
-  const tiles = new Map(); // タイル番号 → canvas
+  const tiles = new Map(); // 'row,col' → canvas
 
   // ---------- 開く・閉じる ----------
 
-  function open(p, { focusFlagId = null } = {}) {
+  // keepZoom: 同じ日の中でページを切り替えたときは倍率を保つ
+  function open(p, { focusFlagId = null, keepZoom = false } = {}) {
     page = p;
     undoStack = [];
     dirty = false;
     updateUndo();
     closePop();
+    closeEraserMenu();
     clearTiles();
-    scroller.scrollTop = 0;
-    scale = 1;
-    layout();
+    if (!keepZoom) zoom = 1;
+    layout({ px: 0, py: 0, vx: 0, vy: 0 });
     if (focusFlagId) focusFlag(focusFlagId);
   }
 
   async function close() {
     await flushSave();
     closePop();
+    closeEraserMenu();
     clearTiles();
     clearLive();
     page = null;
   }
 
-  // ---------- レイアウト ----------
+  // ---------- レイアウト(倍率・大きさ・スクロール位置) ----------
 
-  function layout() {
+  // anchor: ページ上の点 (px, py) を、画面上の位置 (vx, vy)(スクロール領域の左上から)に合わせる。
+  // 省略時は、今見ている位置(横は中央、縦は上端)を保つ。
+  function layout(anchor) {
     if (!page) return;
-    const w = scroller.clientWidth;
-    if (!w) return;
-    const logicalTop = scroller.scrollTop / scale;
+    const cw = scroller.clientWidth;
+    const ch = scroller.clientHeight;
+    if (!cw) return;
+    if (!anchor && scale) {
+      anchor = {
+        px: (scroller.scrollLeft + cw / 2 - sheet.offsetLeft) / scale,
+        py: (scroller.scrollTop - sheet.offsetTop) / scale,
+        vx: cw / 2, vy: 0,
+      };
+    }
     dpr = Math.min(window.devicePixelRatio || 1, 3);
-    sheetW = w;
-    scale = w / PAGE_W;
+    const base = cw / PAGE_W;
+    minZoom = Math.min(1, (ch - 24) / (page.h * base)); // 1ページ全体が収まる倍率
+    zoom = clamp(zoom, minZoom, MAX_ZOOM);
+    scale = base * zoom;
+    sheetW = Math.round(PAGE_W * scale);
     sheetH = Math.round(page.h * scale);
-    sheet.style.width = w + 'px';
+    sheet.style.width = sheetW + 'px';
     sheet.style.height = sheetH + 'px';
+    sheet.style.margin = zoom < 1 ? '12px auto' : '0 auto';
     for (const c of [live, predict]) {
       c.width = Math.round(c.clientWidth * dpr);
       c.height = Math.round(c.clientHeight * dpr);
     }
     clearTiles();
     renderFlags();
-    scroller.scrollTop = logicalTop * scale;
+    if (anchor) {
+      scroller.scrollLeft = sheet.offsetLeft + anchor.px * scale - anchor.vx;
+      scroller.scrollTop = sheet.offsetTop + anchor.py * scale - anchor.vy;
+    }
     updateTiles();
   }
 
@@ -115,7 +144,7 @@ export function createEditor(els, { onChange, onError }) {
     requestAnimationFrame(() => { scrollQueued = false; updateTiles(); });
   }, { passive: true });
 
-  // ---------- タイル ----------
+  // ---------- マス目(タイル) ----------
 
   function clearTiles() {
     for (const c of tiles.values()) { c.width = 0; c.height = 0; c.remove(); }
@@ -123,62 +152,69 @@ export function createEditor(els, { onChange, onError }) {
   }
 
   function updateTiles() {
-    if (!page || !sheetH) return;
-    const top = scroller.scrollTop;
-    const vh = scroller.clientHeight;
-    const count = Math.ceil(sheetH / TILE);
-    const first = Math.max(0, Math.floor(top / TILE) - 1);
-    const last = Math.min(count - 1, Math.floor((top + vh) / TILE) + 1);
-    for (const [i, c] of tiles) {
-      if (i < first || i > last) { c.width = 0; c.height = 0; c.remove(); tiles.delete(i); }
+    if (!page || !sheetH || pinch) return;
+    const x0 = scroller.scrollLeft - sheet.offsetLeft;
+    const y0 = scroller.scrollTop - sheet.offsetTop;
+    const cols = Math.ceil(sheetW / TILE);
+    const rows = Math.ceil(sheetH / TILE);
+    const c0 = clamp(Math.floor(x0 / TILE), 0, cols - 1);
+    const c1 = clamp(Math.floor((x0 + scroller.clientWidth) / TILE), 0, cols - 1);
+    const r0 = clamp(Math.floor(y0 / TILE) - 1, 0, rows - 1);
+    const r1 = clamp(Math.floor((y0 + scroller.clientHeight) / TILE) + 1, 0, rows - 1);
+    for (const [key, c] of tiles) {
+      const [r, col] = key.split(',').map(Number);
+      if (r < r0 || r > r1 || col < c0 || col > c1) { c.width = 0; c.height = 0; c.remove(); tiles.delete(key); }
     }
-    for (let i = first; i <= last; i++) {
-      if (tiles.has(i)) continue;
-      const c = document.createElement('canvas');
-      c.className = 'tile';
-      sheet.insertBefore(c, flagLayer);
-      tiles.set(i, c);
-      renderTile(i, c);
+    for (let r = r0; r <= r1; r++) {
+      for (let col = c0; col <= c1; col++) {
+        const key = r + ',' + col;
+        if (tiles.has(key)) continue;
+        const c = document.createElement('canvas');
+        c.className = 'tile';
+        c.dataset.r = r;
+        c.dataset.c = col;
+        sheet.insertBefore(c, flagLayer);
+        tiles.set(key, c);
+        renderTile(c);
+      }
     }
   }
 
-  function tileContext(i, c) {
+  function tileContext(c) {
     const ctx = c.getContext('2d');
-    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, -dpr * i * TILE);
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, -dpr * c.dataset.c * TILE, -dpr * c.dataset.r * TILE);
     return ctx;
   }
 
-  function tileRange(i) {
-    return [(i * TILE) / scale, ((i + 1) * TILE) / scale];
+  // マスが受け持つ範囲(ページ座標)[x0, y0, x1, y1]
+  function tileRect(c) {
+    const x = c.dataset.c * TILE, y = c.dataset.r * TILE;
+    return [x / scale, y / scale, (x + TILE) / scale, (y + TILE) / scale];
   }
 
-  function renderTile(i, c) {
-    const h = Math.min(TILE, sheetH - i * TILE);
-    c.style.top = i * TILE + 'px';
-    c.style.width = sheetW + 'px';
+  function renderTile(c) {
+    const x = c.dataset.c * TILE, y = c.dataset.r * TILE;
+    const w = Math.min(TILE, sheetW - x), h = Math.min(TILE, sheetH - y);
+    c.style.left = x + 'px';
+    c.style.top = y + 'px';
+    c.style.width = w + 'px';
     c.style.height = h + 'px';
-    c.width = Math.round(sheetW * dpr);
+    c.width = Math.round(w * dpr);
     c.height = Math.round(h * dpr);
-    const ctx = tileContext(i, c);
-    const [y0, y1] = tileRange(i);
+    const ctx = tileContext(c);
+    const [x0, y0, x1, y1] = tileRect(c);
     drawRuled(ctx, y0, y1, scale);
-    for (const s of page.strokes) {
-      if (s.b[3] >= y0 && s.b[1] <= y1) drawStroke(ctx, s);
-    }
+    drawStrokesIn(ctx, page.strokes, x0, y0, x1, y1);
   }
+
+  const overlaps = (b, t) => b[2] >= t[0] && b[0] <= t[2] && b[3] >= t[1] && b[1] <= t[3];
 
   function paintOnTiles(s) {
-    for (const [i, c] of tiles) {
-      const [y0, y1] = tileRange(i);
-      if (s.b[3] >= y0 && s.b[1] <= y1) drawStroke(tileContext(i, c), s);
-    }
+    for (const c of tiles.values()) if (overlaps(s.b, tileRect(c))) drawStroke(tileContext(c), s);
   }
 
-  function rerenderRange(top, bottom) {
-    for (const [i, c] of tiles) {
-      const [y0, y1] = tileRange(i);
-      if (bottom >= y0 && top <= y1) renderTile(i, c);
-    }
+  function rerenderRect(b) {
+    for (const c of tiles.values()) if (overlaps(b, tileRect(c))) renderTile(c);
   }
 
   // ---------- 書いている最中の表示 ----------
@@ -193,7 +229,7 @@ export function createEditor(els, { onChange, onError }) {
     ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * a.ox, dpr * a.oy);
   }
 
-  // ---------- 入力 ----------
+  // ---------- 入力(ペン) ----------
 
   function toPage(e, a) {
     let p = 0.5;
@@ -202,14 +238,15 @@ export function createEditor(els, { onChange, onError }) {
   }
 
   function onPointerDown(e) {
-    if (!page || action) return;
-    if (e.pointerType === 'touch') return;                 // 指はスクロール用
+    if (!page || action || pinch) return;
+    if (e.pointerType === 'touch') return;                 // 指はスクロール・ピンチ用
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     if (e.target.closest('.flag-badge, .flag-pop')) return;
     e.preventDefault();
     closePop();
+    closeEraserMenu();
     // 書いている間はスクロールを完全に止める(慣性スクロール中にペンを置いた場合も止まる)
-    scroller.style.overflowY = 'hidden';
+    scroller.style.overflow = 'hidden';
     sheet.setPointerCapture(e.pointerId);
     penActive = e.pointerType === 'pen';
     lastPenAt = performance.now();
@@ -219,17 +256,19 @@ export function createEditor(els, { onChange, onError }) {
     const a = { id: e.pointerId, left: sr.left, top: sr.top, ox: sr.left - lr.left, oy: sr.top - lr.top };
     const p = toPage(e, a);
 
-    if (tool === 'pen') {
-      action = {
-        ...a, kind: 'pen',
-        stroke: { id: uid(), w: penW, c: color, pts: [p.x, p.y, p.p] },
-        straight: false, anchor: { x: p.x, y: p.y }, holdTimer: null,
-      };
+    if (tool === 'pen' || tool === 'marker') {
+      const marker = tool === 'marker';
+      if (marker) p.p = 0.5;
+      const stroke = marker
+        ? { id: uid(), w: MARKER_W, c: markerColor, hl: 1, pts: [p.x, p.y, p.p] }
+        : { id: uid(), w: penW, c: color, pts: [p.x, p.y, p.p] };
+      action = { ...a, kind: 'pen', stroke, straight: false, anchor: { x: p.x, y: p.y }, holdTimer: null };
+      if (marker) live.style.mixBlendMode = 'multiply'; // 書いている最中も文字が透けて見えるように
       armHold(action);
       setTransform(liveCtx, action);
-      liveCtx.fillStyle = color;
+      liveCtx.fillStyle = stroke.c;
       liveCtx.beginPath();
-      liveCtx.arc(p.x, p.y, widthOf(penW, p.p) / 2, 0, Math.PI * 2);
+      liveCtx.arc(p.x, p.y, strokeWidth(stroke, p.p) / 2, 0, Math.PI * 2);
       liveCtx.fill();
     } else if (tool === 'eraser') {
       action = { ...a, kind: 'eraser', ops: [], last: p };
@@ -265,11 +304,12 @@ export function createEditor(els, { onChange, onError }) {
     clearTimeout(a.holdTimer);
     penActive = false;
     lastPenAt = performance.now();
-    scroller.style.overflowY = '';
+    scroller.style.overflow = '';
     if (a.kind === 'pen') finishStroke(a.stroke);
     else if (a.kind === 'eraser') finishErase(a);
     else finishFlag(a);
     clearLive();
+    live.style.mixBlendMode = '';
   }
 
   sheet.addEventListener('pointerdown', onPointerDown);
@@ -277,9 +317,10 @@ export function createEditor(els, { onChange, onError }) {
   sheet.addEventListener('pointerup', onPointerUp);
   sheet.addEventListener('pointercancel', onPointerUp);
 
-  // iPad Safari の誤スクロール・手のひら対策。
+  // ---------- 入力(指):誤スクロール・手のひら対策とピンチ ----------
   // ペンが触れている/離した直後/手のひらのような大きな接触 のどれかがあった操作は、
-  // すべての指が離れるまでスクロールさせない。
+  // すべての指が離れるまでスクロールもピンチもさせない。
+
   function onTouch(e) {
     if (e.target.closest && e.target.closest('button')) return;
     if (e.type === 'touchstart' && (penActive || performance.now() - lastPenAt < AFTER_PEN_MS)) {
@@ -288,9 +329,17 @@ export function createEditor(els, { onChange, onError }) {
     for (const t of e.touches) {
       if (t.touchType === 'stylus' || (t.radiusX || 0) > PALM_RADIUS) touchBlocked = true;
     }
+    if (!touchBlocked && !penActive && !action && e.touches.length === 2) {
+      e.preventDefault();
+      if (!pinch) startPinch(e.touches);
+      else movePinch(e.touches);
+      return;
+    }
+    if (pinch) endPinch();
     if (touchBlocked || penActive) e.preventDefault();
   }
   function onTouchEnd(e) {
+    if (pinch && e.touches.length < 2) endPinch();
     if (e.touches.length === 0) touchBlocked = false;
   }
   scroller.addEventListener('touchstart', onTouch, { passive: false });
@@ -298,7 +347,43 @@ export function createEditor(els, { onChange, onError }) {
   scroller.addEventListener('touchend', onTouchEnd);
   scroller.addEventListener('touchcancel', onTouchEnd);
 
-  // ---------- ペン ----------
+  // ピンチ中は見た目だけ拡大縮小(CSS)し、指を離したときにその倍率で描き直す
+  function startPinch(ts) {
+    const [a, b] = ts;
+    const mx = (a.clientX + b.clientX) / 2, my = (a.clientY + b.clientY) / 2;
+    const sr = sheet.getBoundingClientRect();
+    closePop();
+    closeEraserMenu();
+    pinch = {
+      d0: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1,
+      z0: zoom, k: 1, mx0: mx, my0: my, mx, my,
+      px: (mx - sr.left) / scale, py: (my - sr.top) / scale,
+    };
+    sheet.style.transformOrigin = `${mx - sr.left}px ${my - sr.top}px`;
+  }
+
+  function movePinch(ts) {
+    const [a, b] = ts;
+    const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    pinch.mx = (a.clientX + b.clientX) / 2;
+    pinch.my = (a.clientY + b.clientY) / 2;
+    pinch.k = clamp(pinch.z0 * d / pinch.d0, minZoom, MAX_ZOOM) / pinch.z0;
+    sheet.style.transform = `translate(${pinch.mx - pinch.mx0}px, ${pinch.my - pinch.my0}px) scale(${pinch.k})`;
+  }
+
+  function endPinch() {
+    const p = pinch;
+    pinch = null;
+    sheet.style.transform = '';
+    sheet.style.transformOrigin = '';
+    let z = p.z0 * p.k;
+    if (Math.abs(z - 1) < SNAP_ZOOM) z = 1;
+    zoom = z;
+    const sr = scroller.getBoundingClientRect();
+    layout({ px: p.px, py: p.py, vx: p.mx - sr.left, vy: p.my - sr.top });
+  }
+
+  // ---------- ペン・蛍光ペン ----------
 
   // 最新の点 i が加わったときに、確定した区間(中間点から中間点まで)を描く。
   // render.js の drawStroke と同じ曲線になるようにしている。
@@ -311,11 +396,11 @@ export function createEditor(els, { onChange, onError }) {
     liveCtx.lineJoin = 'round';
     liveCtx.beginPath();
     if (i === 1) {
-      liveCtx.lineWidth = widthOf(s.w, p[2]);
+      liveCtx.lineWidth = strokeWidth(s, p[2]);
       liveCtx.moveTo(p[0], p[1]);
       liveCtx.lineTo(mx(0), my(0));
     } else {
-      liveCtx.lineWidth = widthOf(s.w, p[(i - 1) * 3 + 2]);
+      liveCtx.lineWidth = strokeWidth(s, p[(i - 1) * 3 + 2]);
       liveCtx.moveTo(mx(i - 2), my(i - 2));
       liveCtx.quadraticCurveTo(p[(i - 1) * 3], p[(i - 1) * 3 + 1], mx(i - 1), my(i - 1));
     }
@@ -332,7 +417,7 @@ export function createEditor(els, { onChange, onError }) {
     const pts = a.stroke.pts;
     const n = pts.length;
     if (Math.hypot(p.x - pts[n - 3], p.y - pts[n - 2]) < 0.35) return;
-    const pr = pts[n - 1] * (1 - PRESSURE_SMOOTH) + p.p * PRESSURE_SMOOTH;
+    const pr = a.stroke.hl ? 0.5 : pts[n - 1] * (1 - PRESSURE_SMOOTH) + p.p * PRESSURE_SMOOTH;
     pts.push(p.x, p.y, pr);
     setTransform(liveCtx, a);
     drawLivePiece(a.stroke, pts.length / 3 - 1);
@@ -340,15 +425,17 @@ export function createEditor(els, { onChange, onError }) {
 
   // まだ確定していない末尾(最後の中間点 → 最新の点 → 先読み位置)を仮に描く
   function drawTail(a, e) {
-    const p = a.stroke.pts;
+    const s = a.stroke;
+    const p = s.pts;
     const n = p.length / 3;
     clearCanvas(predCtx, predict);
     if (n < 2) return;
     setTransform(predCtx, a);
-    predCtx.strokeStyle = a.stroke.c;
+    predCtx.globalAlpha = s.hl ? 0.6 : 1;
+    predCtx.strokeStyle = s.c;
     predCtx.lineCap = 'round';
     predCtx.lineJoin = 'round';
-    predCtx.lineWidth = widthOf(a.stroke.w, p[n * 3 - 1]);
+    predCtx.lineWidth = strokeWidth(s, p[n * 3 - 1]);
     predCtx.beginPath();
     predCtx.moveTo((p[(n - 2) * 3] + p[(n - 1) * 3]) / 2, (p[(n - 2) * 3 + 1] + p[(n - 1) * 3 + 1]) / 2);
     predCtx.lineTo(p[(n - 1) * 3], p[(n - 1) * 3 + 1]);
@@ -358,13 +445,15 @@ export function createEditor(els, { onChange, onError }) {
       predCtx.lineTo(q.x, q.y);
     }
     predCtx.stroke();
+    predCtx.globalAlpha = 1;
   }
 
   function finishStroke(s) {
     s.pts = s.pts.map(r2);
     s.b = strokeBBox(s.pts, s.w).map(r2);
     page.strokes.push(s);
-    paintOnTiles(s);
+    if (s.hl) rerenderRect(s.b);   // 蛍光ペンは文字の下に来るよう、その範囲を描き直す
+    else paintOnTiles(s);
     pushUndo({ type: 'stroke', stroke: s });
     markDirty();
   }
@@ -410,19 +499,20 @@ export function createEditor(els, { onChange, onError }) {
   }
 
   function drawStraight(a) {
-    const p = a.stroke.pts;
+    const s = a.stroke;
+    const p = s.pts;
     clearLive();
     setTransform(liveCtx, a);
-    liveCtx.strokeStyle = a.stroke.c;
+    liveCtx.strokeStyle = s.c;
     liveCtx.lineCap = 'round';
-    liveCtx.lineWidth = widthOf(a.stroke.w, p[2]);
+    liveCtx.lineWidth = strokeWidth(s, p[2]);
     liveCtx.beginPath();
     liveCtx.moveTo(p[0], p[1]);
     liveCtx.lineTo(p[3], p[4]);
     liveCtx.stroke();
   }
 
-  // ---------- 消しゴム(こすったところだけ消える) ----------
+  // ---------- 消しゴム(部分消し / 線ごと消す) ----------
 
   function distToSeg(px, py, ax, ay, bx, by) {
     const dx = bx - ax, dy = by - ay;
@@ -483,24 +573,30 @@ export function createEditor(els, { onChange, onError }) {
   }
 
   function eraseAlong(a, b) {
-    let top = Infinity, bottom = -Infinity;
+    const dirtyRect = [Infinity, Infinity, -Infinity, -Infinity];
     for (let i = page.strokes.length - 1; i >= 0; i--) {
       const s = page.strokes[i];
       if (!hits(s, a, b)) continue;
-      const pieces = cut(s, a, b);
-      if (!pieces) continue;
-      const added = pieces.map((pts) => {
-        const ns = { id: uid(), w: s.w, pts: pts.map(r2) };
-        if (s.c) ns.c = s.c;
-        ns.b = strokeBBox(ns.pts, ns.w).map(r2);
-        return ns;
-      });
+      let added = [];
+      if (eraserMode === 'partial') {
+        const pieces = cut(s, a, b);
+        if (!pieces) continue;
+        added = pieces.map((pts) => {
+          const ns = { id: uid(), w: s.w, pts: pts.map(r2) };
+          if (s.c) ns.c = s.c;
+          if (s.hl) ns.hl = 1;
+          ns.b = strokeBBox(ns.pts, ns.w).map(r2);
+          return ns;
+        });
+      }
       page.strokes.splice(i, 1, ...added);
       action.ops.push({ index: i, removed: s, added });
-      top = Math.min(top, s.b[1]);
-      bottom = Math.max(bottom, s.b[3]);
+      dirtyRect[0] = Math.min(dirtyRect[0], s.b[0]);
+      dirtyRect[1] = Math.min(dirtyRect[1], s.b[1]);
+      dirtyRect[2] = Math.max(dirtyRect[2], s.b[2]);
+      dirtyRect[3] = Math.max(dirtyRect[3], s.b[3]);
     }
-    if (bottom >= top) rerenderRange(top, bottom);
+    if (dirtyRect[2] >= dirtyRect[0]) rerenderRect(dirtyRect);
   }
 
   function showEraser(p) {
@@ -520,6 +616,25 @@ export function createEditor(els, { onChange, onError }) {
     pushUndo({ type: 'erase', ops: a.ops });
     markDirty();
   }
+
+  // 消しゴムの種類メニュー(消しゴムを選んだ状態でもう一度タップすると開く)
+  function openEraserMenu() {
+    const btn = toolButtons.find((b) => b.dataset.tool === 'eraser');
+    const r = btn.getBoundingClientRect();
+    eraserMenu.hidden = false;
+    eraserMenu.style.top = r.bottom + 6 + 'px';
+    eraserMenu.style.left = Math.max(8, Math.min(r.left + r.width / 2 - eraserMenu.offsetWidth / 2,
+      window.innerWidth - eraserMenu.offsetWidth - 8)) + 'px';
+  }
+  function closeEraserMenu() { eraserMenu.hidden = true; }
+
+  function setEraserMode(m) {
+    eraserMode = m;
+    for (const b of eraserButtons) b.setAttribute('aria-pressed', String(b.dataset.eraser === m));
+    eraserLabel.textContent = m === 'partial' ? '部分消し' : '線ごと消す';
+    closeEraserMenu();
+  }
+  for (const b of eraserButtons) b.addEventListener('click', () => setEraserMode(b.dataset.eraser));
 
   // ---------- あとで確認(囲んでフラグ) ----------
 
@@ -616,13 +731,15 @@ export function createEditor(els, { onChange, onError }) {
 
   document.addEventListener('pointerdown', (e) => {
     if (popEl && !e.target.closest('.flag-pop, .flag-badge')) closePop();
+    if (!eraserMenu.hidden && !e.target.closest('.eraser-menu, [data-tool="eraser"]')) closeEraserMenu();
   }, true);
 
   function focusFlag(id) {
     const f = page.flags.find((x) => x.id === id);
     if (!f) return;
     const vh = scroller.clientHeight;
-    scroller.scrollTop = Math.max(0, f.y * scale - Math.max(40, (vh - f.h * scale) / 2));
+    scroller.scrollTop = sheet.offsetTop + f.y * scale - Math.max(40, (vh - f.h * scale) / 2);
+    scroller.scrollLeft = sheet.offsetLeft + f.x * scale - 40;
     updateTiles();
     pulse(f.id);
     renderFlags();
@@ -631,14 +748,21 @@ export function createEditor(els, { onChange, onError }) {
   // ---------- 道具・色・太さ ----------
 
   function setTool(t) {
+    if (t === 'eraser' && tool === 'eraser') {   // 消しゴムをもう一度タップ → 種類を選ぶ
+      if (eraserMenu.hidden) openEraserMenu(); else closeEraserMenu();
+      return;
+    }
     tool = t;
     for (const b of toolButtons) b.setAttribute('aria-pressed', String(b.dataset.tool === t));
+    // 左の「色・太さ」の枠は、最後に使ったペン(ペン/蛍光ペン)のものを表示する
+    if (t === 'pen' || t === 'marker') toolbar.dataset.palette = t;
     hint.hidden = t !== 'flag';
     closePop();
+    closeEraserMenu();
   }
   for (const b of toolButtons) b.addEventListener('click', () => setTool(b.dataset.tool));
 
-  // 色や太さを選ぶとペンに切り替わる
+  // 色や太さを選ぶと、そのペンに切り替わる
   function setColor(c) {
     color = c;
     for (const b of colorButtons) b.setAttribute('aria-pressed', String(b.dataset.color === c));
@@ -652,6 +776,13 @@ export function createEditor(els, { onChange, onError }) {
     setTool('pen');
   }
   for (const b of widthButtons) b.addEventListener('click', () => setWidth(Number(b.dataset.width)));
+
+  function setMarkerColor(c) {
+    markerColor = c;
+    for (const b of markerButtons) b.setAttribute('aria-pressed', String(b.dataset.color === c));
+    setTool('marker');
+  }
+  for (const b of markerButtons) b.addEventListener('click', () => setMarkerColor(b.dataset.color));
 
   // ---------- 元に戻す(開いているページの中だけ) ----------
 
@@ -671,7 +802,7 @@ export function createEditor(els, { onChange, onError }) {
     if (u.type === 'stroke') {
       const i = page.strokes.lastIndexOf(u.stroke);
       if (i >= 0) page.strokes.splice(i, 1);
-      rerenderRange(u.stroke.b[1], u.stroke.b[3]);
+      rerenderRect(u.stroke.b);
     } else if (u.type === 'erase') {
       for (let k = u.ops.length - 1; k >= 0; k--) {
         const op = u.ops[k];
@@ -680,7 +811,7 @@ export function createEditor(els, { onChange, onError }) {
           if (i >= 0) page.strokes.splice(i, 1);
         }
         page.strokes.splice(Math.min(op.index, page.strokes.length), 0, op.removed);
-        rerenderRange(op.removed.b[1], op.removed.b[3]);
+        rerenderRect(op.removed.b);
       }
     } else if (u.type === 'flag') {
       const i = page.flags.indexOf(u.flag);

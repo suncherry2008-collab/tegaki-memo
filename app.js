@@ -28,6 +28,7 @@ const uid = () => (crypto.randomUUID ? crypto.randomUUID()
   : Date.now().toString(36) + Math.random().toString(36).slice(2));
 
 const editor = createEditor({
+  toolbar: $('ed-bar'),
   scroller: $('ed-scroller'),
   sheet: $('ed-sheet'),
   flagLayer: $('ed-flags'),
@@ -38,6 +39,10 @@ const editor = createEditor({
   toolButtons: [...document.querySelectorAll('#view-editor .tool[data-tool]')],
   colorButtons: [...document.querySelectorAll('#view-editor .color')],
   widthButtons: [...document.querySelectorAll('#view-editor .width')],
+  markerButtons: [...document.querySelectorAll('#view-editor .mcolor')],
+  eraserMenu: $('eraser-menu'),
+  eraserButtons: [...document.querySelectorAll('#eraser-menu button')],
+  eraserLabel: $('eraser-label'),
 }, { onChange: onPageChange, onError: (msg) => showToast(msg) });
 
 let editorOpen = false;
@@ -138,9 +143,9 @@ async function openDay(dayId, pageId, flagId, seq) {
   showPage(i, flagId);
 }
 
-function showPage(i, flagId = null) {
+function showPage(i, flagId = null, keepZoom = false) {
   cur = i;
-  editor.open(pages[i], { focusFlagId: flagId });
+  editor.open(pages[i], { focusFlagId: flagId, keepZoom });
   pgLabel.textContent = `${i + 1} / ${pages.length}`;
   pgPrev.disabled = i === 0;
   pgNext.disabled = i === pages.length - 1;
@@ -151,7 +156,7 @@ function showPage(i, flagId = null) {
 async function goToPage(i) {
   if (i < 0 || i >= pages.length || i === cur) return;
   await editor.flush();
-  showPage(i);
+  showPage(i, null, true); // 同じ日の中では倍率を保つ
 }
 
 // 書いたとき:その日の記録がまだ保存されていなければ保存する
@@ -179,7 +184,7 @@ async function addPage() {
     console.error(err);
     showToast('保存できませんでした。iPadの空き容量を確認してください。');
   }
-  showPage(pages.length - 1);
+  showPage(pages.length - 1, null, true);
 }
 
 async function deletePage() {
@@ -201,7 +206,7 @@ async function deletePage() {
     console.error(err);
     showToast('削除できませんでした。');
   }
-  showPage(Math.max(0, removedAt - 1)); // 削除したページの1つ前を表示
+  showPage(Math.max(0, removedAt - 1), null, true); // 削除したページの1つ前を表示
 }
 
 pgPrev.addEventListener('click', () => goToPage(cur - 1));
