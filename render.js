@@ -28,6 +28,8 @@ export function strokeBBox(pts, w) {
 }
 
 // 1本のストロークを描く。pts は [x, y, 筆圧, x, y, 筆圧, ...] の平坦な配列。
+// 点と点の中間点を通る2次曲線でつなぎ、角ばらない滑らかな線にする。
+// (書いている最中の表示 editor.js の drawLivePiece も同じ描き方にして、ペンを離したときに線が変化しないようにしている)
 export function drawStroke(ctx, s, minW = 0) {
   const p = s.pts;
   const n = p.length / 3;
@@ -36,25 +38,32 @@ export function drawStroke(ctx, s, minW = 0) {
   ctx.fillStyle = color;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+  const W = (i) => Math.max(widthOf(s.w, p[i * 3 + 2]), minW);
   if (n === 1) {
-    const r = Math.max(widthOf(s.w, p[2]), minW) / 2;
     ctx.beginPath();
-    ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+    ctx.arc(p[0], p[1], W(0) / 2, 0, Math.PI * 2);
     ctx.fill();
     return;
   }
-  let curW = -1;
-  for (let i = 1; i < n; i++) {
-    const w = Math.max(widthOf(s.w, (p[i * 3 - 1] + p[i * 3 + 2]) / 2), minW);
-    if (w !== curW) {
-      if (curW > 0) ctx.stroke();
+  const mx = (i) => (p[i * 3] + p[i * 3 + 3]) / 2;
+  const my = (i) => (p[i * 3 + 1] + p[i * 3 + 4]) / 2;
+  let cur = W(0);
+  ctx.lineWidth = cur;
+  ctx.beginPath();
+  ctx.moveTo(p[0], p[1]);
+  ctx.lineTo(mx(0), my(0));
+  for (let i = 1; i < n - 1; i++) {
+    const w = W(i);
+    if (w !== cur) {
+      ctx.stroke();
       ctx.beginPath();
       ctx.lineWidth = w;
-      curW = w;
-      ctx.moveTo(p[i * 3 - 3], p[i * 3 - 2]);
+      cur = w;
+      ctx.moveTo(mx(i - 1), my(i - 1));
     }
-    ctx.lineTo(p[i * 3], p[i * 3 + 1]);
+    ctx.quadraticCurveTo(p[i * 3], p[i * 3 + 1], mx(i), my(i));
   }
+  ctx.lineTo(p[(n - 1) * 3], p[(n - 1) * 3 + 1]);
   ctx.stroke();
 }
 
@@ -71,7 +80,7 @@ export function drawRuled(ctx, y0, y1, scale) {
   ctx.stroke();
 }
 
-// メモの一部(rect)を切り出した画像を作る。一覧のサムネイルやフラグ一覧で使う。
+// ページの一部(rect)を切り出した画像を作る。一覧のサムネイルやフラグ一覧で使う。
 export function renderRegion(note, rect, maxW, maxH, maxScale = Infinity) {
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
   const s = Math.min(maxW / rect.w, maxH / rect.h, maxScale);

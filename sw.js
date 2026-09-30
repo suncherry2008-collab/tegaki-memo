@@ -2,7 +2,7 @@
 // 仕組み: キャッシュがあれば即座にそれを返し、裏で最新版を取得して次回起動時に反映する。
 // アプリを更新して配信したら CACHE の番号を上げると、確実に新しい版へ切り替わる。
 
-const CACHE = 'tegaki-memo-v2';
+const CACHE = 'tegaki-memo-v3';
 const ASSETS = [
   './',
   'index.html',

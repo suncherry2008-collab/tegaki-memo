@@ -190,6 +190,8 @@ svg {
   color: var(--muted);
 }
 
+.day-name { color: var(--ink); font-weight: 600; }
+
 .card-flag {
   padding: 1px 8px;
   border-radius: 6px;
@@ -277,16 +279,6 @@ svg {
 
 .btn-back svg { width: 26px; height: 26px; stroke-width: 2.2; }
 .btn-back:active { background: #E1E4E9; }
-
-.ed-date {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  font-size: 15px;
-  color: var(--muted);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
 
 .tools {
   display: flex;
@@ -512,7 +504,111 @@ svg {
   box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--ink);
 }
 
-/* 日付の見出し(メモ一覧・カレンダー共通) */
+/* ペンの太さ */
+.widths {
+  display: flex;
+  align-items: center;
+  margin-right: 4px;
+}
+
+.width {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 56px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+}
+
+.width span {
+  display: block;
+  width: 22px;
+  border-radius: 4px;
+  background: var(--ink);
+}
+
+.width[aria-pressed="true"] {
+  background: #DDE1E7;
+}
+
+/* 下のページ切り替えバー */
+.pagebar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 60px;
+  padding: 4px max(16px, env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+
+.pg-date {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.pg-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pg-move {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 48px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.pg-move svg { width: 24px; height: 24px; stroke-width: 2.2; }
+.pg-move:active { background: var(--bg); }
+.pg-move:disabled { opacity: .35; }
+
+.pg-label {
+  min-width: 4.5em;
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.pg-actions {
+  flex: 1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 16px;
+}
+
+.pg-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 48px;
+  padding: 0 16px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  font-size: 16px;
+  white-space: nowrap;
+}
+
+.pg-btn svg { width: 20px; height: 20px; }
+.pg-btn:active { background: var(--bg); }
+.pg-del { color: #9A3A30; }
+.pg-del:disabled { opacity: .35; }
+
+/* 日付の見出し(一覧・カレンダー共通) */
 .day-head {
   margin: 32px 0 14px;
   font-size: 17px;
@@ -601,6 +697,8 @@ svg {
   color: var(--muted);
 }
 
+.cal-day:disabled { opacity: .35; }
+
 .cal-day.has {
   border-color: var(--line);
   background: var(--paper);
@@ -639,8 +737,8 @@ svg {
 /* iPad mini 縦向きなど幅が狭いとき */
 @media (max-width: 760px) {
   .tool { min-width: 56px; }
-  .color { width: 36px; }
-  .ed-date { display: none; }
+  .color, .width { width: 34px; }
+  .pg-date { font-size: 15px; }
   .flag-item { flex-direction: column; align-items: stretch; }
   .flag-meta { width: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }
   .flag-date { flex-basis: 100%; }
