@@ -1,4 +1,6 @@
-// 画面遷移(#/ メモ一覧, #/flags あとで確認, #/new, #/note/ID, #/note/ID/flag/FID)と一覧表示。
+// 画面遷移と一覧表示。
+//   #/ メモ一覧(日付ごと)  #/calendar[/YYYY-MM | /YYYY-MM-DD] カレンダー  #/flags あとで確認
+//   #/new 新しいメモ  #/note/ID  #/note/ID/flag/FID
 
 import * as db from './db.js';
 import { createEditor, INITIAL_HEIGHT } from './editor.js';
@@ -10,6 +12,7 @@ const homeView = $('view-home');
 const editorView = $('view-editor');
 const homeMain = $('home-main');
 const tabNotes = $('tab-notes');
+const tabCalendar = $('tab-calendar');
 const tabFlags = $('tab-flags');
 const flagCount = $('flag-count');
 const toast = $('toast');
@@ -25,6 +28,7 @@ const editor = createEditor({
   undoBtn: $('ed-undo'),
   hint: $('ed-hint'),
   toolButtons: [...document.querySelectorAll('#view-editor .tool[data-tool]')],
+  colorButtons: [...document.querySelectorAll('#view-editor .color')],
 }, { onError: (msg) => showToast(msg) });
 
 let editorOpen = false;
@@ -34,12 +38,24 @@ let routeSeq = 0;
 // ---------- 日付 ----------
 
 const WEEK = ['日', '月', '火', '水', '木', '金', '土'];
-function formatDate(ms) {
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function formatDay(ms) {
   const d = new Date(ms);
   const y = d.getFullYear() !== new Date().getFullYear() ? `${d.getFullYear()}年` : '';
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${y}${d.getMonth() + 1}月${d.getDate()}日(${WEEK[d.getDay()]}) ${hh}:${mm}`;
+  return `${y}${d.getMonth() + 1}月${d.getDate()}日(${WEEK[d.getDay()]})`;
+}
+function formatTime(ms) {
+  const d = new Date(ms);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function formatDate(ms) {
+  return `${formatDay(ms)} ${formatTime(ms)}`;
+}
+// 端末の時刻での日付キー 'YYYY-MM-DD'
+function dayKey(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
 // ---------- 画面遷移 ----------
@@ -75,7 +91,8 @@ async function route() {
     showEditor(normalize(note), parts[2] === 'flag' ? parts[3] : null);
     return;
   }
-  await showHome(parts[0] === 'flags' ? 'flags' : 'notes', seq);
+  const tab = parts[0] === 'flags' ? 'flags' : parts[0] === 'calendar' ? 'calendar' : 'notes';
+  await showHome(tab, parts[1], seq);
 }
 
 function showEditor(note, focusFlagId = null) {
@@ -90,20 +107,21 @@ $('ed-back').addEventListener('click', () => { location.hash = backTo; });
 
 // ---------- ホーム(メモ一覧 / あとで確認) ----------
 
-async function showHome(tab, seq) {
+async function showHome(tab, param, seq) {
   const notes = (await db.getAllNotes()).map(normalize);
   if (seq !== routeSeq) return;
   notes.sort((a, b) => b.createdAt - a.createdAt);
-  backTo = tab === 'flags' ? '#/flags' : '#/';
+  backTo = location.hash || '#/';
 
   editorView.hidden = true;
   homeView.hidden = false;
   tabNotes.setAttribute('aria-selected', String(tab === 'notes'));
+  tabCalendar.setAttribute('aria-selected', String(tab === 'calendar'));
   tabFlags.setAttribute('aria-selected', String(tab === 'flags'));
   updateFlagCount(notes);
-  homeMain.scrollTop = 0;
-  if (tab === 'notes') renderNoteList(notes);
-  else renderFlagList(notes);
+  if (tab === 'notes') { homeMain.scrollTop = 0; renderNoteList(notes); }
+  else if (tab === 'calendar') renderCalendar(notes, param);
+  else { homeMain.scrollTop = 0; renderFlagList(notes); }
 }
 
 function updateFlagCount(notes) {
@@ -129,39 +147,170 @@ function drawLater(jobs) {
   requestAnimationFrame(step);
 }
 
+// メモのカード(サムネイル + 下のラベル)
+function noteCard(note, label, jobs) {
+  const li = document.createElement('li');
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'note-card';
+  const thumb = document.createElement('span');
+  thumb.className = 'thumb';
+  const date = document.createElement('span');
+  date.className = 'date';
+  date.textContent = label;
+  if (note.flags.length) {
+    const mark = document.createElement('span');
+    mark.className = 'card-flag';
+    mark.textContent = `あとで確認 ${note.flags.length}`;
+    date.appendChild(mark);
+  }
+  btn.append(thumb, date);
+  btn.addEventListener('click', () => { location.hash = `#/note/${note.id}`; });
+  li.appendChild(btn);
+  jobs.push(() => thumb.appendChild(renderRegion(note, { x: 0, y: 0, w: PAGE_W, h: 700 }, 320, 224)));
+  return li;
+}
+
+// メモ一覧:日付ごとに区切って新しい順に並べる
 function renderNoteList(notes) {
   homeMain.textContent = '';
   if (!notes.length) {
     homeMain.appendChild(emptyMessage('まだメモがありません。「新しいメモ」から書き始められます。'));
     return;
   }
-  const ul = document.createElement('ul');
-  ul.className = 'note-grid';
   const jobs = [];
+  let key = null;
+  let ul = null;
   for (const note of notes) {
-    const li = document.createElement('li');
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'note-card';
-    const thumb = document.createElement('span');
-    thumb.className = 'thumb';
-    const date = document.createElement('span');
-    date.className = 'date';
-    date.textContent = formatDate(note.createdAt);
-    if (note.flags.length) {
-      const mark = document.createElement('span');
-      mark.className = 'card-flag';
-      mark.textContent = `あとで確認 ${note.flags.length}`;
-      date.appendChild(mark);
+    const k = dayKey(note.createdAt);
+    if (k !== key) {
+      key = k;
+      const h = document.createElement('h2');
+      h.className = 'day-head';
+      h.textContent = formatDay(note.createdAt);
+      ul = document.createElement('ul');
+      ul.className = 'note-grid';
+      homeMain.append(h, ul);
     }
-    btn.append(thumb, date);
-    btn.addEventListener('click', () => { location.hash = `#/note/${note.id}`; });
-    li.appendChild(btn);
-    ul.appendChild(li);
-    jobs.push(() => thumb.appendChild(renderRegion(note, { x: 0, y: 0, w: PAGE_W, h: 700 }, 320, 224)));
+    ul.appendChild(noteCard(note, formatTime(note.createdAt), jobs));
   }
-  homeMain.appendChild(ul);
   drawLater(jobs);
+}
+
+// カレンダー:メモを書いた日に印が付く。日付をタップするとその日のメモが下に並ぶ。
+function renderCalendar(notes, param) {
+  const today = new Date();
+  let y = today.getFullYear();
+  let m = today.getMonth();
+  let selected = dayKey(today.getTime());
+  if (param && /^\d{4}-\d{2}(-\d{2})?$/.test(param)) {
+    y = +param.slice(0, 4);
+    m = +param.slice(5, 7) - 1;
+    selected = param.length === 10 ? param : null;
+  }
+
+  const byDay = new Map();
+  for (const n of notes) {
+    const k = dayKey(n.createdAt);
+    if (!byDay.has(k)) byDay.set(k, []);
+    byDay.get(k).push(n);
+  }
+
+  homeMain.textContent = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'calendar';
+
+  // 月の切り替え
+  const nav = document.createElement('div');
+  nav.className = 'cal-nav';
+  const monthKey = (yy, mm) => { const d = new Date(yy, mm, 1); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`; };
+  const prev = document.createElement('button');
+  prev.type = 'button';
+  prev.className = 'cal-move';
+  prev.setAttribute('aria-label', '前の月');
+  prev.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>';
+  prev.addEventListener('click', () => location.replace(`#/calendar/${monthKey(y, m - 1)}`));
+  const next = document.createElement('button');
+  next.type = 'button';
+  next.className = 'cal-move';
+  next.setAttribute('aria-label', '次の月');
+  next.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>';
+  next.addEventListener('click', () => location.replace(`#/calendar/${monthKey(y, m + 1)}`));
+  const title = document.createElement('h2');
+  title.className = 'cal-title';
+  title.textContent = `${y}年${m + 1}月`;
+  nav.append(prev, title, next);
+
+  // 日付のマス
+  const grid = document.createElement('div');
+  grid.className = 'cal-grid';
+  WEEK.forEach((w, i) => {
+    const h = document.createElement('span');
+    h.className = 'cal-week' + (i === 0 ? ' sun' : i === 6 ? ' sat' : '');
+    h.textContent = w;
+    grid.appendChild(h);
+  });
+  const first = new Date(y, m, 1).getDay();
+  for (let i = 0; i < first; i++) grid.appendChild(document.createElement('span'));
+  const days = new Date(y, m + 1, 0).getDate();
+  const todayKey = dayKey(today.getTime());
+  for (let d = 1; d <= days; d++) {
+    const k = `${y}-${pad2(m + 1)}-${pad2(d)}`;
+    const list = byDay.get(k) || [];
+    const cell = document.createElement('button');
+    cell.type = 'button';
+    cell.className = 'cal-day';
+    if (list.length) cell.classList.add('has');
+    if (k === todayKey) cell.classList.add('today');
+    if (k === selected) cell.setAttribute('aria-pressed', 'true');
+    const num = document.createElement('span');
+    num.className = 'num';
+    num.textContent = d;
+    cell.appendChild(num);
+    if (list.length) {
+      const marks = document.createElement('span');
+      marks.className = 'marks';
+      const cnt = document.createElement('span');
+      cnt.className = 'cnt';
+      cnt.textContent = `${list.length}件`;
+      marks.appendChild(cnt);
+      if (list.some((n) => n.flags.length)) {
+        const f = document.createElement('span');
+        f.className = 'fdot';
+        f.setAttribute('aria-label', 'あとで確認あり');
+        marks.appendChild(f);
+      }
+      cell.appendChild(marks);
+    }
+    cell.setAttribute('aria-label', `${m + 1}月${d}日 メモ${list.length}件`);
+    cell.addEventListener('click', () => location.replace(`#/calendar/${k}`));
+    grid.appendChild(cell);
+  }
+  wrap.append(nav, grid);
+  homeMain.appendChild(wrap);
+
+  // 選んだ日のメモ
+  if (selected) {
+    const [sy, sm, sd] = selected.split('-').map(Number);
+    const h = document.createElement('h2');
+    h.className = 'day-head';
+    h.textContent = formatDay(new Date(sy, sm - 1, sd).getTime());
+    homeMain.appendChild(h);
+    const list = byDay.get(selected) || [];
+    if (!list.length) {
+      const p = document.createElement('p');
+      p.className = 'day-empty';
+      p.textContent = 'この日のメモはありません。';
+      homeMain.appendChild(p);
+    } else {
+      const ul = document.createElement('ul');
+      ul.className = 'note-grid';
+      const jobs = [];
+      for (const n of list) ul.appendChild(noteCard(n, formatTime(n.createdAt), jobs));
+      homeMain.appendChild(ul);
+      drawLater(jobs);
+    }
+  }
 }
 
 function renderFlagList(notes) {
@@ -247,6 +396,7 @@ async function markDone(note, flag, li, notes) {
 }
 
 tabNotes.addEventListener('click', () => { location.hash = '#/'; });
+tabCalendar.addEventListener('click', () => { location.hash = '#/calendar'; });
 tabFlags.addEventListener('click', () => { location.hash = '#/flags'; });
 $('btn-new').addEventListener('click', () => { location.hash = '#/new'; });
 

@@ -20,6 +20,7 @@
     <header class="bar">
       <div class="tabs" role="tablist">
         <button type="button" class="tab" id="tab-notes" role="tab" aria-selected="true">メモ</button>
+        <button type="button" class="tab" id="tab-calendar" role="tab" aria-selected="false">カレンダー</button>
         <button type="button" class="tab" id="tab-flags" role="tab" aria-selected="false">
           あとで確認<span class="count" id="flag-count" hidden>0</span>
         </button>
@@ -45,6 +46,11 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20l1.2-4.4L16.4 4.4a2.1 2.1 0 013 3L8.2 18.6 4 20z"/></svg>
           <span>ペン</span>
         </button>
+        <div class="colors" role="group" aria-label="ペンの色">
+          <button type="button" class="color" data-color="#1F2A3A" aria-label="黒" aria-pressed="true"><span style="background:#1F2A3A"></span></button>
+          <button type="button" class="color" data-color="#D33A2C" aria-label="赤" aria-pressed="false"><span style="background:#D33A2C"></span></button>
+          <button type="button" class="color" data-color="#2563C9" aria-label="青" aria-pressed="false"><span style="background:#2563C9"></span></button>
+        </div>
         <button type="button" class="tool" data-tool="eraser" aria-pressed="false">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 20h11"/><path d="M5.4 15.6l9.2-9.2a2 2 0 012.8 0l1.2 1.2a2 2 0 010 2.8L10 19H8.8l-3.4-3.4z"/></svg>
           <span>消しゴム</span>

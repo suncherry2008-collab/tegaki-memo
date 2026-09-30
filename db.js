@@ -5,7 +5,8 @@
 //   createdAt: number,   // 作成日時(ms)。一覧の日付表示に使う
 //   updatedAt: number,
 //   height: number,      // ページの高さ(ページ座標)。書き進めると自動で伸びる
-//   strokes: [{ id, w, pts: [x, y, 筆圧, ...], b: [minX, minY, maxX, maxY] }],
+//   strokes: [{ id, w, c, pts: [x, y, 筆圧, ...], b: [minX, minY, maxX, maxY] }],
+//            c = 線の色(例 '#D33A2C')。無い場合は黒として扱う
 //   flags:   [{ id, x, y, w, h, createdAt }]   // 「あとで確認」で囲んだ範囲
 // }
 

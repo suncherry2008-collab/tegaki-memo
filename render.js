@@ -31,8 +31,9 @@ export function strokeBBox(pts, w) {
 export function drawStroke(ctx, s, minW = 0) {
   const p = s.pts;
   const n = p.length / 3;
-  ctx.strokeStyle = INK;
-  ctx.fillStyle = INK;
+  const color = s.c || INK;   // 色が無い線(以前のメモ)は黒
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   if (n === 1) {

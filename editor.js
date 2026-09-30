@@ -22,13 +22,17 @@ const MIN_FLAG_SIZE = 24;             // これより小さい囲みは無視す
 const PALM_RADIUS = 32;               // これより大きい接触は手のひらとみなす(px)
 const AFTER_PEN_MS = 400;             // ペンを離した直後の指操作を無視する時間
 const UNDO_LIMIT = 100;
+const HOLD_MS = 600;                  // 線を引いてこの時間ペンを止めると直線になる
+const HOLD_TOLERANCE = 3;             // 「止めている」とみなす揺れの範囲(ページ座標)
+const MIN_LINE = 60;                  // これより短い線は直線にしない(文字の画を守るため)
+const SNAP_DEG = 4;                   // 水平・垂直からこの角度以内ならぴったり揃える
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID()
   : Date.now().toString(36) + Math.random().toString(36).slice(2));
 const r2 = (v) => Math.round(v * 100) / 100;
 
 export function createEditor(els, { onError }) {
-  const { scroller, sheet, flagLayer, live, undoBtn, hint, toolButtons } = els;
+  const { scroller, sheet, flagLayer, live, undoBtn, hint, toolButtons, colorButtons } = els;
   const liveCtx = live.getContext('2d');
 
   let note = null;
@@ -37,6 +41,7 @@ export function createEditor(els, { onError }) {
   let sheetW = 0;
   let sheetH = 0;
   let tool = 'pen';
+  let color = colorButtons[0].dataset.color;
   let undoStack = [];
   let action = null;       // 書いている最中の操作
   let dirty = false;
@@ -215,9 +220,14 @@ export function createEditor(els, { onError }) {
     const p = toPage(e, a);
 
     if (tool === 'pen') {
-      action = { ...a, kind: 'pen', stroke: { id: uid(), w: PEN_WIDTH, pts: [p.x, p.y, p.p] } };
+      action = {
+        ...a, kind: 'pen',
+        stroke: { id: uid(), w: PEN_WIDTH, c: color, pts: [p.x, p.y, p.p] },
+        straight: false, anchor: { x: p.x, y: p.y }, holdTimer: null,
+      };
+      armHold(action);
       setLiveTransform(action);
-      liveCtx.fillStyle = '#1F2A3A';
+      liveCtx.fillStyle = color;
       liveCtx.beginPath();
       liveCtx.arc(p.x, p.y, widthOf(PEN_WIDTH, p.p) / 2, 0, Math.PI * 2);
       liveCtx.fill();
@@ -249,6 +259,7 @@ export function createEditor(els, { onError }) {
     if (!action || e.pointerId !== action.id) return;
     const a = action;
     action = null;
+    clearTimeout(a.holdTimer);
     penActive = false;
     lastPenAt = performance.now();
     if (a.kind === 'pen') finishStroke(a.stroke);
@@ -279,19 +290,78 @@ export function createEditor(els, { onError }) {
   // ---------- ペン ----------
 
   function addPenPoint(p) {
-    const pts = action.stroke.pts;
+    const a = action;
+    if (a.straight) { setLineEnd(a, p); drawStraight(a); return; }
+    if (Math.hypot(p.x - a.anchor.x, p.y - a.anchor.y) > HOLD_TOLERANCE) {
+      a.anchor = { x: p.x, y: p.y };
+      armHold(a);
+    }
+    const pts = a.stroke.pts;
     const n = pts.length;
     const lx = pts[n - 3], ly = pts[n - 2], lp = pts[n - 1];
     if (Math.hypot(p.x - lx, p.y - ly) < 0.4) return;
     pts.push(p.x, p.y, p.p);
     setLiveTransform(action);
-    liveCtx.strokeStyle = '#1F2A3A';
+    liveCtx.strokeStyle = a.stroke.c;
     liveCtx.lineCap = 'round';
     liveCtx.lineJoin = 'round';
     liveCtx.lineWidth = widthOf(PEN_WIDTH, (lp + p.p) / 2);
     liveCtx.beginPath();
     liveCtx.moveTo(lx, ly);
     liveCtx.lineTo(p.x, p.y);
+    liveCtx.stroke();
+  }
+
+  // ---------- 止めると直線 ----------
+  // 線を引いたままペンを HOLD_MS 止めると、始点から今の位置までの直線に置き換える。
+  // その後はペンを離すまで終点がペンについてくる。
+
+  function armHold(a) {
+    clearTimeout(a.holdTimer);
+    a.holdTimer = setTimeout(() => tryStraighten(a), HOLD_MS);
+  }
+
+  function tryStraighten(a) {
+    if (action !== a || a.straight) return;
+    const p = a.stroke.pts;
+    const n = p.length;
+    const sx = p[0], sy = p[1], ex = p[n - 3], ey = p[n - 2];
+    const len = Math.hypot(ex - sx, ey - sy);
+    if (len < MIN_LINE) return;
+    // ぐにゃっとした線(文字や図)は直線にしない
+    let dev = 0, pr = 0;
+    for (let i = 0; i < n; i += 3) {
+      dev = Math.max(dev, distToSeg(p[i], p[i + 1], sx, sy, ex, ey));
+      pr += p[i + 2];
+    }
+    if (dev > Math.max(8, len * 0.15)) return;
+    pr = pr / (n / 3);
+    a.straight = true;
+    a.stroke.pts = [sx, sy, pr, ex, ey, pr];
+    setLineEnd(a, { x: ex, y: ey });
+    drawStraight(a);
+  }
+
+  function setLineEnd(a, p) {
+    const pts = a.stroke.pts;
+    let x = p.x, y = p.y;
+    const deg = Math.abs(Math.atan2(y - pts[1], x - pts[0]) * 180 / Math.PI);
+    if (deg < SNAP_DEG || deg > 180 - SNAP_DEG) y = pts[1];          // 水平
+    else if (Math.abs(deg - 90) < SNAP_DEG) x = pts[0];              // 垂直
+    pts[3] = x;
+    pts[4] = y;
+  }
+
+  function drawStraight(a) {
+    const p = a.stroke.pts;
+    clearLive();
+    setLiveTransform(a);
+    liveCtx.strokeStyle = a.stroke.c;
+    liveCtx.lineCap = 'round';
+    liveCtx.lineWidth = widthOf(PEN_WIDTH, p[2]);
+    liveCtx.beginPath();
+    liveCtx.moveTo(p[0], p[1]);
+    liveCtx.lineTo(p[3], p[4]);
     liveCtx.stroke();
   }
 
@@ -462,6 +532,14 @@ export function createEditor(els, { onError }) {
     closePop();
   }
   for (const b of toolButtons) b.addEventListener('click', () => setTool(b.dataset.tool));
+
+  // 色を選ぶとペンに切り替わる
+  function setColor(c) {
+    color = c;
+    for (const b of colorButtons) b.setAttribute('aria-pressed', String(b.dataset.color === c));
+    setTool('pen');
+  }
+  for (const b of colorButtons) b.addEventListener('click', () => setColor(b.dataset.color));
 
   // ---------- 元に戻す ----------
 
