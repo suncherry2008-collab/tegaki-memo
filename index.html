@@ -109,6 +109,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
         </button>
       </div>
+      <button type="button" class="pg-btn pg-bg" id="pg-bg" aria-haspopup="menu">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 10h16M4 15h16"/></svg>
+        <span id="pg-bg-label">罫線</span>
+      </button>
       <div class="pg-actions">
         <button type="button" class="pg-btn" id="pg-add">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
@@ -120,6 +124,11 @@
         </button>
       </div>
     </footer>
+    <div class="eraser-menu bg-menu" id="bg-menu" role="menu" hidden>
+      <button type="button" data-bg="ruled" aria-pressed="true"><strong>罫線</strong><span>メモや議事録に</span></button>
+      <button type="button" data-bg="grid" aria-pressed="false"><strong>方眼</strong><span>図や簡易設計図に</span></button>
+      <button type="button" data-bg="plain" aria-pressed="false"><strong>無地</strong><span>線なしで自由に</span></button>
+    </div>
   </section>
 
   <div class="toast" id="toast" role="status" hidden></div>

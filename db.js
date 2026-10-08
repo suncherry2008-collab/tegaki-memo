@@ -10,6 +10,7 @@
 // page = {                       // pages ストア。書くたびに保存されるのは開いているページだけ
 //   id, day: 'YYYY-MM-DD',
 //   h: number,                   // ページの高さ(ページ座標。横幅は1000固定)
+//   bg: 'ruled' | 'grid' | 'plain', // ページの種類(罫線・方眼・無地)。無い場合は罫線
 //   strokes: [{ id, w, c, pts: [x, y, 筆圧, ...], b: [minX, minY, maxX, maxY] }],
 //            // w = 太さ、c = 色(無い場合は黒)、hl = 1 なら蛍光ペン
 //   flags:   [{ id, x, y, w, h, createdAt }],   // 「あとで確認」で囲んだ範囲

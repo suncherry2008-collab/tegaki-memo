@@ -334,11 +334,11 @@ svg {
 .scroller {
   position: absolute;
   inset: 0;
-  overflow: auto;
-  -webkit-overflow-scrolling: touch;
+  overflow: hidden;      /* スクロール位置は editor.js が動かす */
   overscroll-behavior: contain;
   background: #E4E7EB;   /* ページの外側。縮小したときにページの端が分かる */
-  touch-action: pan-x pan-y;
+  /* スクロール・ピンチは editor.js で処理する(ブラウザに任せるとペンの線が途切れるため) */
+  touch-action: none;
 }
 
 .sheet {
@@ -346,8 +346,7 @@ svg {
   margin: 0 auto;
   background: var(--paper);
   box-shadow: 0 0 0 1px var(--line);
-  /* 指1本はスクロール。ピンチは editor.js で処理。ペンは editor.js 側でスクロールを止める */
-  touch-action: pan-x pan-y;
+  touch-action: none;
 }
 
 .tile {
@@ -664,6 +663,7 @@ svg {
 .pg-btn svg { width: 20px; height: 20px; }
 .pg-btn:active { background: var(--bg); }
 .pg-del { color: #9A3A30; }
+.pg-bg { min-width: 96px; }
 .pg-del:disabled { opacity: .35; }
 
 /* 日付の見出し(一覧・カレンダー共通) */
@@ -798,6 +798,8 @@ svg {
   .color, .mcolor, .width { width: 34px; }
   .palette { min-width: 204px; }
   .pg-date { font-size: 15px; }
+  .pagebar { gap: 8px; }
+  .pg-btn { padding: 0 12px 0 10px; }
   .flag-item { flex-direction: column; align-items: stretch; }
   .flag-meta { width: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }
   .flag-date { flex-basis: 100%; }

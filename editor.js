@@ -2,8 +2,10 @@
 //
 // 入力の扱い:
 //   Apple Pencil(pen)・マウス → 書く / 蛍光ペン / 消す / 囲む
-//   指1本                      → スクロール
-//   指2本                      → ピンチで縮小・拡大(1ページ全体表示 〜 3倍)
+//   指1本                      → スクロール(慣性つき)
+//   指2本                      → ピンチで縮小・拡大(1ページ全体表示 〜 3倍)+移動
+//   スクロールとピンチはブラウザに任せず、すべてここで処理する(touch-action: none)。
+//   ブラウザ任せだと、iPad Safari ではペンの線が途中で打ち切られたり、ピンチに切り替わらなかったりするため。
 //
 // 描画の仕組み:
 //   1枚の巨大なcanvasは使わない(iPadのcanvasサイズ・メモリ上限対策)。
@@ -11,7 +13,7 @@
 //   書いている最中の線は画面に重ねた live canvas に描き、ペンを離した時点でマスへ確定する。
 //   さらに predict canvas に「最後の点から先読みした位置まで」を仮に描き、ペンとの遅れを小さく見せる。
 
-import { PAGE_W, drawStroke, drawStrokesIn, drawRuled, strokeBBox, strokeWidth } from './render.js';
+import { PAGE_W, drawStroke, drawStrokesIn, drawBackground, strokeBBox, strokeWidth } from './render.js';
 import { putPage } from './db.js';
 
 const TILE = 512;                     // マス目の大きさ(CSS px)
@@ -20,14 +22,18 @@ const SNAP_ZOOM = 0.08;               // 等倍からこの範囲で指を離す
 const MARKER_W = 24;                  // 蛍光ペンの太さ(ページ座標)
 const ERASER_R = 12;                  // 消しゴムの半径(ページ座標)
 const MIN_FLAG_SIZE = 24;             // これより小さい囲みは無視する
-const PALM_RADIUS = 32;               // これより大きい接触は手のひらとみなす(px)
+const PALM_RADIUS = 48;               // 指を置いた瞬間の接触がこれより大きければ手のひらとみなす(px)
+const PAN_START = 8;                  // 指がこれ以上動いたらスクロールを始める(px)。手のひらの小さなずれでは動かさない
+const FRICTION = 0.94;                // 慣性スクロールの減速(1フレームあたり)
 const AFTER_PEN_MS = 500;             // ペンを離した直後の指操作を無視する時間
 const UNDO_LIMIT = 100;
 const HOLD_MS = 600;                  // 線を引いてこの時間ペンを止めると直線になる
 const HOLD_TOLERANCE = 3;             // 「止めている」とみなす揺れの範囲(ページ座標)
 const MIN_LINE = 60;                  // これより短い線は直線にしない(文字の画を守るため)
 const SNAP_DEG = 4;                   // 水平・垂直からこの角度以内ならぴったり揃える
-const PRESSURE_SMOOTH = 0.35;         // 筆圧のなめらかさ(小さいほど太さの変化がなだらか)
+const PRESSURE_SMOOTH = 0.3;          // 筆圧のなめらかさ(小さいほど太さの変化がなだらか)
+const SMOOTH_MIN = 0.5;               // 手ぶれ補正の強さ(ゆっくり書くとき)。1で補正なし。小さいほど強い
+const SMOOTH_SPEED = 0.6;             // この速さ(ページ座標/ms)以上で書くと補正なし(遅れを出さないため)
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID()
   : Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -60,7 +66,6 @@ export function createEditor(els, { onChange, onError }) {
   let saveTimer = null;
   let penActive = false;
   let lastPenAt = 0;
-  let touchBlocked = false;
   let popEl = null;
   let pulseId = null;      // 目立たせるフラグ(一覧から開いたとき・囲んだ直後)
   let pulseTimer = null;
@@ -203,7 +208,7 @@ export function createEditor(els, { onChange, onError }) {
     c.height = Math.round(h * dpr);
     const ctx = tileContext(c);
     const [x0, y0, x1, y1] = tileRect(c);
-    drawRuled(ctx, y0, y1, scale);
+    drawBackground(ctx, page.bg, x0, y0, x1, y1, scale);
     drawStrokesIn(ctx, page.strokes, x0, y0, x1, y1);
   }
 
@@ -245,8 +250,8 @@ export function createEditor(els, { onChange, onError }) {
     e.preventDefault();
     closePop();
     closeEraserMenu();
-    // 書いている間はスクロールを完全に止める(慣性スクロール中にペンを置いた場合も止まる)
-    scroller.style.overflow = 'hidden';
+    stopInertia(); // 慣性スクロール中にペンを置いたら止める
+    endTouchGesture();
     sheet.setPointerCapture(e.pointerId);
     penActive = e.pointerType === 'pen';
     lastPenAt = performance.now();
@@ -262,7 +267,10 @@ export function createEditor(els, { onChange, onError }) {
       const stroke = marker
         ? { id: uid(), w: MARKER_W, c: markerColor, hl: 1, pts: [p.x, p.y, p.p] }
         : { id: uid(), w: penW, c: color, pts: [p.x, p.y, p.p] };
-      action = { ...a, kind: 'pen', stroke, straight: false, anchor: { x: p.x, y: p.y }, holdTimer: null };
+      action = {
+        ...a, kind: 'pen', stroke, straight: false, anchor: { x: p.x, y: p.y }, holdTimer: null,
+        sm: { x: p.x, y: p.y, t: e.timeStamp }, raw: p,
+      };
       if (marker) live.style.mixBlendMode = 'multiply'; // 書いている最中も文字が透けて見えるように
       armHold(action);
       setTransform(liveCtx, action);
@@ -288,7 +296,7 @@ export function createEditor(els, { onChange, onError }) {
     const a = action;
     for (const ev of list) {
       const p = toPage(ev, a);
-      if (a.kind === 'pen') addPenPoint(p);
+      if (a.kind === 'pen') addPenPoint(smooth(a, p, ev.timeStamp));
       else if (a.kind === 'eraser') { eraseAlong(a.last, p); a.last = p; }
       else a.pts.push(p.x, p.y);
     }
@@ -300,11 +308,12 @@ export function createEditor(els, { onChange, onError }) {
   function onPointerUp(e) {
     if (!action || e.pointerId !== action.id) return;
     const a = action;
+    // 手ぶれ補正で少し手前に残った線を、ペンを離した位置まで届かせる
+    if (a.kind === 'pen' && !a.straight) addPenPoint({ x: a.raw.x, y: a.raw.y, p: a.raw.p });
     action = null;
     clearTimeout(a.holdTimer);
     penActive = false;
     lastPenAt = performance.now();
-    scroller.style.overflow = '';
     if (a.kind === 'pen') finishStroke(a.stroke);
     else if (a.kind === 'eraser') finishErase(a);
     else finishFlag(a);
@@ -312,40 +321,152 @@ export function createEditor(els, { onChange, onError }) {
     live.style.mixBlendMode = '';
   }
 
+  // 手ぶれ補正:ゆっくり書くときは少しなめらかに、速く書くときはそのまま(遅れを出さない)
+  function smooth(a, p, t) {
+    a.raw = p;
+    const sm = a.sm;
+    const dt = Math.max(1, t - sm.t);
+    const speed = Math.hypot(p.x - sm.x, p.y - sm.y) / dt;
+    const k = Math.min(1, SMOOTH_MIN + (1 - SMOOTH_MIN) * speed / SMOOTH_SPEED);
+    sm.x += (p.x - sm.x) * k;
+    sm.y += (p.y - sm.y) * k;
+    sm.t = t;
+    return { x: sm.x, y: sm.y, p: p.p };
+  }
+
   sheet.addEventListener('pointerdown', onPointerDown);
   sheet.addEventListener('pointermove', onPointerMove);
   sheet.addEventListener('pointerup', onPointerUp);
   sheet.addEventListener('pointercancel', onPointerUp);
 
-  // ---------- 入力(指):誤スクロール・手のひら対策とピンチ ----------
-  // ペンが触れている/離した直後/手のひらのような大きな接触 のどれかがあった操作は、
-  // すべての指が離れるまでスクロールもピンチもさせない。
+  // ---------- 入力(指):スクロール・ピンチ・手のひら対策 ----------
+  // 次のどれかに当てはまる操作は、すべての指が離れるまで無視する(誤スクロール・誤ピンチ防止)。
+  //   ペンが触れている / ペンを離した直後 / 指を置いた瞬間の接触が手のひらのように大きい / Apple Pencil の接触
 
-  function onTouch(e) {
-    if (e.target.closest && e.target.closest('button')) return;
-    if (e.type === 'touchstart' && (penActive || performance.now() - lastPenAt < AFTER_PEN_MS)) {
-      touchBlocked = true;
+  let gesture = null;      // { kind: 'wait' | 'pan' | 'ignore', ... }
+  let inertia = 0;         // 慣性スクロールの requestAnimationFrame 番号
+
+  function stopInertia() {
+    if (inertia) cancelAnimationFrame(inertia);
+    inertia = 0;
+  }
+
+  function endTouchGesture() {
+    if (pinch) endPinch();
+    if (gesture && gesture.kind !== 'ignore') gesture = { kind: 'ignore' };
+  }
+
+  const fingers = (e) => [...e.touches].filter((t) => t.touchType !== 'stylus');
+
+  function onTouchStart(e) {
+    if (e.target.closest && e.target.closest('button')) return; // フラグの丸などのボタンはそのまま押せる
+    stopInertia();
+    const stylus = [...e.changedTouches].some((t) => t.touchType === 'stylus');
+    const palm = [...e.changedTouches].some((t) => (t.radiusX || 0) > PALM_RADIUS);
+    // 画面に触れている指がすべて今置かれたもの = 新しい操作の始まり。前の操作の状態は持ち越さない
+    if (e.touches.length === e.changedTouches.length) {
+      if (pinch) endPinch();
+      gesture = null;
     }
-    for (const t of e.touches) {
-      if (t.touchType === 'stylus' || (t.radiusX || 0) > PALM_RADIUS) touchBlocked = true;
-    }
-    if (!touchBlocked && !penActive && !action && e.touches.length === 2) {
-      e.preventDefault();
-      if (!pinch) startPinch(e.touches);
-      else movePinch(e.touches);
+    if (stylus || palm || penActive || action || performance.now() - lastPenAt < AFTER_PEN_MS) {
+      if (pinch) endPinch();
+      gesture = { kind: 'ignore' };
       return;
     }
-    if (pinch) endPinch();
-    if (touchBlocked || penActive) e.preventDefault();
+    if (gesture && gesture.kind === 'ignore') return;
+    const fs = fingers(e);
+    if (fs.length === 2) {
+      gesture = null;
+      startPinch(fs);
+    } else if (fs.length === 1 && !pinch) {
+      const t = fs[0];
+      gesture = { kind: 'wait', x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, hist: [] };
+    } else if (fs.length > 2) {
+      if (pinch) endPinch();
+      gesture = { kind: 'ignore' };
+    }
   }
+
+  function onTouchMove(e) {
+    if (e.cancelable) e.preventDefault();
+    if (penActive || action) return;
+    if (pinch) {
+      const fs = fingers(e);
+      if (fs.length >= 2) movePinch(fs);
+      return;
+    }
+    if (!gesture || gesture.kind === 'ignore') return;
+    const t = fingers(e)[0];
+    if (!t) return;
+    const g = gesture;
+    if (g.kind === 'wait') {
+      if (Math.hypot(t.clientX - g.x0, t.clientY - g.y0) < PAN_START) return;
+      g.kind = 'pan';
+    }
+    scroller.scrollLeft -= t.clientX - g.x;
+    scroller.scrollTop -= t.clientY - g.y;
+    g.x = t.clientX;
+    g.y = t.clientY;
+    const now = performance.now();
+    g.hist.push({ x: t.clientX, y: t.clientY, t: now });
+    while (g.hist.length > 2 && now - g.hist[0].t > 100) g.hist.shift();
+  }
+
   function onTouchEnd(e) {
-    if (pinch && e.touches.length < 2) endPinch();
-    if (e.touches.length === 0) touchBlocked = false;
+    const fs = fingers(e);
+    if (pinch && fs.length < 2) {
+      endPinch();
+      gesture = { kind: 'ignore' }; // 残った指で急に動かないよう、全部離すまで待つ
+    }
+    if (fs.length === 0) {
+      const g = gesture;
+      gesture = null;
+      if (g && g.kind === 'pan') startInertia(g.hist);
+    }
   }
-  scroller.addEventListener('touchstart', onTouch, { passive: false });
-  scroller.addEventListener('touchmove', onTouch, { passive: false });
+
+  function startInertia(hist) {
+    if (hist.length < 2) return;
+    const a = hist[0], b = hist[hist.length - 1];
+    const dt = b.t - a.t;
+    if (dt <= 0 || performance.now() - b.t > 60) return; // 指を止めてから離したときは滑らせない
+    let vx = (b.x - a.x) / dt * 16, vy = (b.y - a.y) / dt * 16; // px / フレーム
+    const step = () => {
+      vx *= FRICTION;
+      vy *= FRICTION;
+      if (Math.hypot(vx, vy) < 0.4) { inertia = 0; return; }
+      scroller.scrollLeft -= vx;
+      scroller.scrollTop -= vy;
+      inertia = requestAnimationFrame(step);
+    };
+    inertia = requestAnimationFrame(step);
+  }
+
+  scroller.addEventListener('touchstart', onTouchStart, { passive: false });
+  scroller.addEventListener('touchmove', onTouchMove, { passive: false });
   scroller.addEventListener('touchend', onTouchEnd);
   scroller.addEventListener('touchcancel', onTouchEnd);
+  // Safari のブラウザ側の拡大を止める
+  for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {
+    scroller.addEventListener(type, (e) => e.preventDefault());
+  }
+
+  // PC(マウス・トラックパッド)での確認用:ホイールでスクロール、Ctrl+ホイール/トラックパッドのピンチで拡大縮小
+  scroller.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    stopInertia();
+    if (e.ctrlKey) {
+      const sr = scroller.getBoundingClientRect();
+      const vx = e.clientX - sr.left, vy = e.clientY - sr.top;
+      const px = (scroller.scrollLeft + vx - sheet.offsetLeft) / scale;
+      const py = (scroller.scrollTop + vy - sheet.offsetTop) / scale;
+      zoom = clamp(zoom * Math.exp(-e.deltaY / 200), minZoom, MAX_ZOOM);
+      layout({ px, py, vx, vy });
+    } else {
+      scroller.scrollLeft += e.deltaX;
+      scroller.scrollTop += e.deltaY;
+    }
+  }, { passive: false });
 
   // ピンチ中は見た目だけ拡大縮小(CSS)し、指を離したときにその倍率で描き直す
   function startPinch(ts) {
@@ -440,9 +561,17 @@ export function createEditor(els, { onChange, onError }) {
     predCtx.moveTo((p[(n - 2) * 3] + p[(n - 1) * 3]) / 2, (p[(n - 2) * 3 + 1] + p[(n - 1) * 3 + 1]) / 2);
     predCtx.lineTo(p[(n - 1) * 3], p[(n - 1) * 3 + 1]);
     const predicted = e.getPredictedEvents ? e.getPredictedEvents() : [];
-    for (const ev of predicted) {
-      const q = toPage(ev, a);
-      predCtx.lineTo(q.x, q.y);
+    if (predicted.length) {
+      for (const ev of predicted) {
+        const q = toPage(ev, a);
+        predCtx.lineTo(q.x, q.y);
+      }
+    } else if (n >= 3) {
+      // 先読みに対応していないブラウザ(Safari)では、直前の動きから少しだけ先を仮に描く(ペンを離すと消える)
+      const dx = p[(n - 1) * 3] - p[(n - 3) * 3], dy = p[(n - 1) * 3 + 1] - p[(n - 3) * 3 + 1];
+      const len = Math.hypot(dx, dy);
+      const k = len ? Math.min(len * 0.5, 6) / len : 0;
+      predCtx.lineTo(p[(n - 1) * 3] + dx * k, p[(n - 1) * 3 + 1] + dy * k);
     }
     predCtx.stroke();
     predCtx.globalAlpha = 1;
@@ -856,5 +985,13 @@ export function createEditor(els, { onChange, onError }) {
   });
   window.addEventListener('pagehide', flushSave);
 
-  return { open, close, flush: flushSave };
+  // ページの種類(罫線・方眼・無地)を変える。書いた内容はそのまま。
+  function setBackground(bg) {
+    if (!page || (page.bg || 'ruled') === bg) return;
+    page.bg = bg;
+    for (const c of tiles.values()) renderTile(c);
+    markDirty();
+  }
+
+  return { open, close, flush: flushSave, setBackground };
 }

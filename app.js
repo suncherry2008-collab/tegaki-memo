@@ -23,6 +23,10 @@ const pgPrev = $('pg-prev');
 const pgNext = $('pg-next');
 const pgAdd = $('pg-add');
 const pgDel = $('pg-del');
+const pgBg = $('pg-bg');
+const pgBgLabel = $('pg-bg-label');
+const bgMenu = $('bg-menu');
+const BG_NAMES = { ruled: '罫線', grid: '方眼', plain: '無地' };
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID()
   : Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -66,6 +70,7 @@ function formatDay(k) {
 // ---------- 画面遷移 ----------
 
 async function leaveEditor() {
+  bgMenu.hidden = true;
   if (!editorOpen) return;
   editorOpen = false;
   await editor.close();
@@ -105,9 +110,9 @@ let cur = 0;             // 開いているページの番号
 let dayStored = false;   // 日の記録がすでに保存されているか
 const unsaved = new Set(); // まだ保存していない(何も書いていない)ページ
 
-function newPage(dayId) {
+function newPage(dayId, bg = 'ruled') {
   const now = Date.now();
-  return { id: uid(), day: dayId, h: db.PAGE_H, strokes: [], flags: [], createdAt: now, updatedAt: now };
+  return { id: uid(), day: dayId, h: db.PAGE_H, bg, strokes: [], flags: [], createdAt: now, updatedAt: now };
 }
 
 async function openDay(dayId, pageId, flagId, seq) {
@@ -150,6 +155,7 @@ function showPage(i, flagId = null, keepZoom = false) {
   pgPrev.disabled = i === 0;
   pgNext.disabled = i === pages.length - 1;
   pgDel.disabled = pages.length <= 1;
+  updateBgLabel();
   history.replaceState(null, '', `#/day/${day.id}/page/${pages[i].id}`);
 }
 
@@ -171,7 +177,7 @@ function onPageChange(p) {
 
 async function addPage() {
   await editor.flush();
-  const p = newPage(day.id);
+  const p = newPage(day.id, pages[cur].bg || 'ruled'); // 今のページと同じ種類
   pages.push(p);
   day.pages.push(p.id);
   day.updatedAt = Date.now();
@@ -208,6 +214,33 @@ async function deletePage() {
   }
   showPage(Math.max(0, removedAt - 1), null, true); // 削除したページの1つ前を表示
 }
+
+// ページの種類(罫線・方眼・無地)
+function updateBgLabel() {
+  const bg = pages[cur].bg || 'ruled';
+  pgBgLabel.textContent = BG_NAMES[bg];
+  for (const b of bgMenu.querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.bg === bg));
+}
+function toggleBgMenu() {
+  if (!bgMenu.hidden) { bgMenu.hidden = true; return; }
+  bgMenu.hidden = false;
+  const r = pgBg.getBoundingClientRect();
+  bgMenu.style.top = '';
+  bgMenu.style.bottom = window.innerHeight - r.top + 6 + 'px';
+  bgMenu.style.left = Math.max(8, Math.min(r.left + r.width / 2 - bgMenu.offsetWidth / 2,
+    window.innerWidth - bgMenu.offsetWidth - 8)) + 'px';
+}
+pgBg.addEventListener('click', toggleBgMenu);
+for (const b of bgMenu.querySelectorAll('button')) {
+  b.addEventListener('click', () => {
+    bgMenu.hidden = true;
+    editor.setBackground(b.dataset.bg);
+    updateBgLabel();
+  });
+}
+document.addEventListener('pointerdown', (e) => {
+  if (!bgMenu.hidden && !e.target.closest('#bg-menu, #pg-bg')) bgMenu.hidden = true;
+}, true);
 
 pgPrev.addEventListener('click', () => goToPage(cur - 1));
 pgNext.addEventListener('click', () => goToPage(cur + 1));

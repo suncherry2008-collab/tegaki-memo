@@ -7,10 +7,11 @@ export const INK = '#1F2A3A';
 const RULE_COLOR = '#E6E9EE';
 const RULE_GAP = 48;
 
-// 筆圧(0〜1)から線の太さを決める。0.25刻みに丸めて描画をまとめやすくする。
+// 筆圧(0〜1)から線の太さを決める。軽く書いてもかすれにくいよう変化を穏やかにしている
+// (筆圧0.5 = マウス = 基本の太さ)。1/8刻みに丸めて描画をまとめやすくする。
 export function widthOf(base, pressure) {
   const p = Math.min(1, Math.max(0, pressure));
-  return Math.round(base * (0.45 + 1.1 * p) * 4) / 4;
+  return Math.round(base * (0.68 + 0.45 * Math.sqrt(p)) * 8) / 8;
 }
 
 // ストロークの外接矩形 [minX, minY, maxX, maxY]
@@ -93,6 +94,37 @@ export function drawStrokesIn(ctx, strokes, x0, y0, x1, y1, minW = 0) {
       if (b[2] < x0 || b[0] > x1 || b[3] < y0 || b[1] > y1) continue;
       drawStroke(ctx, s, minW);
     }
+  }
+}
+
+// ページの背景。bg = 'ruled'(罫線・既定)/ 'grid'(方眼)/ 'plain'(無地)。
+// [x0, y0, x1, y1](ページ座標)の範囲だけ描く。
+export function drawBackground(ctx, bg, x0, y0, x1, y1, scale) {
+  if (bg === 'plain') return;
+  if (bg === 'grid') drawGrid(ctx, x0, y0, x1, y1, scale);
+  else drawRuled(ctx, y0, y1, scale);
+}
+
+// 方眼。GRID_GAP(A4横幅1000に対して約5mm)ごとの線と、5マスごとの少し濃い線。
+const GRID_GAP = 24;
+const GRID_COLOR = '#E9ECF0';
+const GRID_MAJOR_COLOR = '#D5DAE1';
+function drawGrid(ctx, x0, y0, x1, y1, scale) {
+  ctx.lineWidth = 1 / scale;
+  for (const major of [false, true]) {
+    ctx.strokeStyle = major ? GRID_MAJOR_COLOR : GRID_COLOR;
+    ctx.beginPath();
+    for (let x = Math.ceil(x0 / GRID_GAP) * GRID_GAP; x <= Math.min(x1, PAGE_W); x += GRID_GAP) {
+      if ((Math.round(x / GRID_GAP) % 5 === 0) !== major) continue;
+      ctx.moveTo(x, y0);
+      ctx.lineTo(x, y1);
+    }
+    for (let y = Math.ceil(y0 / GRID_GAP) * GRID_GAP; y <= y1; y += GRID_GAP) {
+      if ((Math.round(y / GRID_GAP) % 5 === 0) !== major) continue;
+      ctx.moveTo(Math.max(0, x0), y);
+      ctx.lineTo(Math.min(PAGE_W, x1), y);
+    }
+    ctx.stroke();
   }
 }
 
