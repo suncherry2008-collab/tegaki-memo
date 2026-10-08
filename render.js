@@ -33,56 +33,105 @@ export function strokeWidth(s, pressure) {
   return s.hl ? s.w : widthOf(s.w, pressure);
 }
 
+// 丸めない太さ(輪郭の計算用)
+function widthRaw(base, pressure) {
+  const p = Math.min(1, Math.max(0, pressure));
+  return base * (0.68 + 0.45 * Math.sqrt(p));
+}
+
+// 記録された点をなめらかな曲線(Catmull-Rom スプライン)で補間し、細かい点列にする。
+// 点の少ない速い線でも角ばらない。戻り値は [x, y, 筆圧, ...]。
+const STEP = 1.2; // 補間の細かさ(ページ座標)
+export function smoothPoints(p) {
+  const n = p.length / 3;
+  if (n < 3) return p.slice();
+  const out = [p[0], p[1], p[2]];
+  const P = (i) => { i = Math.max(0, Math.min(n - 1, i)); return [p[i * 3], p[i * 3 + 1], p[i * 3 + 2]]; };
+  for (let i = 0; i < n - 1; i++) {
+    const [x0, y0] = P(i - 1), [x1, y1, p1] = P(i), [x2, y2, p2] = P(i + 1), [x3, y3] = P(i + 2);
+    const k = Math.min(24, Math.max(1, Math.ceil(Math.hypot(x2 - x1, y2 - y1) / STEP)));
+    for (let j = 1; j <= k; j++) {
+      const t = j / k, t2 = t * t, t3 = t2 * t;
+      out.push(
+        0.5 * (2 * x1 + (-x0 + x2) * t + (2 * x0 - 5 * x1 + 4 * x2 - x3) * t2 + (-x0 + 3 * x1 - 3 * x2 + x3) * t3),
+        0.5 * (2 * y1 + (-y0 + y2) * t + (2 * y0 - 5 * y1 + 4 * y2 - y3) * t2 + (-y0 + 3 * y1 - 3 * y2 + y3) * t3),
+        p1 + (p2 - p1) * t,
+      );
+    }
+  }
+  return out;
+}
+
 // 1本のストロークを描く。pts は [x, y, 筆圧, x, y, 筆圧, ...] の平坦な配列。
-// 点と点の中間点を通る2次曲線でつなぎ、角ばらない滑らかな線にする。
-// (書いている最中の表示 editor.js の drawLivePiece も同じ描き方にして、ペンを離したときに線が変化しないようにしている)
-// 蛍光ペンは「乗算」で重ねるので、下の罫線や文字が透けて見え、重ね塗りすると少し濃くなる。
+// ペン:線の両側の輪郭を計算して塗りつぶす(太さが筆圧でなめらかに変わり、継ぎ目が出ない)。
+// 蛍光ペン:一定の太さの1本の線。「乗算」で重ねるので、下の罫線や文字が透けて見える。
+// 書いている最中の表示(editor.js)も同じ関数で描くので、ペンを離しても線は変わらない。
 export function drawStroke(ctx, s, minW = 0) {
+  const color = s.c || INK;   // 色が無い線(以前のメモ)は黒
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
   if (s.hl) {
     ctx.save();
     ctx.globalCompositeOperation = 'multiply';
-    drawPath(ctx, s, minW);
+    drawMarker(ctx, s, minW);
     ctx.restore();
   } else {
-    drawPath(ctx, s, minW);
+    drawInk(ctx, s, minW);
   }
 }
 
-function drawPath(ctx, s, minW) {
-  const p = s.pts;
-  const n = p.length / 3;
-  const color = s.c || INK;   // 色が無い線(以前のメモ)は黒
-  ctx.strokeStyle = color;
-  ctx.fillStyle = color;
+function drawMarker(ctx, s, minW) {
+  const q = smoothPoints(s.pts);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  const W = (i) => Math.max(strokeWidth(s, p[i * 3 + 2]), minW);
-  if (n === 1) {
-    ctx.beginPath();
-    ctx.arc(p[0], p[1], W(0) / 2, 0, Math.PI * 2);
-    ctx.fill();
-    return;
-  }
-  const mx = (i) => (p[i * 3] + p[i * 3 + 3]) / 2;
-  const my = (i) => (p[i * 3 + 1] + p[i * 3 + 4]) / 2;
-  let cur = W(0);
-  ctx.lineWidth = cur;
+  ctx.lineWidth = Math.max(s.w, minW);
   ctx.beginPath();
-  ctx.moveTo(p[0], p[1]);
-  ctx.lineTo(mx(0), my(0));
-  for (let i = 1; i < n - 1; i++) {
-    const w = W(i);
-    if (w !== cur) {
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.lineWidth = w;
-      cur = w;
-      ctx.moveTo(mx(i - 1), my(i - 1));
-    }
-    ctx.quadraticCurveTo(p[i * 3], p[i * 3 + 1], mx(i), my(i));
-  }
-  ctx.lineTo(p[(n - 1) * 3], p[(n - 1) * 3 + 1]);
+  ctx.moveTo(q[0], q[1]);
+  if (q.length === 3) ctx.lineTo(q[0] + 0.01, q[1]);
+  for (let i = 3; i < q.length; i += 3) ctx.lineTo(q[i], q[i + 1]);
   ctx.stroke();
+}
+
+function drawInk(ctx, s, minW) {
+  const q = smoothPoints(s.pts);
+  const n = q.length / 3;
+  const R = (i) => Math.max(widthRaw(s.w, q[i * 3 + 2]), minW) / 2;
+  const dot = (i) => { ctx.moveTo(q[i * 3] + R(i), q[i * 3 + 1]); ctx.arc(q[i * 3], q[i * 3 + 1], R(i), 0, Math.PI * 2); };
+  if (n === 1) { ctx.beginPath(); dot(0); ctx.fill(); return; }
+  // 各点での進行方向に垂直な向きへ、太さの半分ずつずらした左右の輪郭
+  const L = new Array(n * 2), Rt = new Array(n * 2);
+  let tx = 0, ty = 0;
+  const sharp = [];
+  for (let i = 0; i < n; i++) {
+    const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+    let dx = q[b * 3] - q[a * 3], dy = q[b * 3 + 1] - q[a * 3 + 1];
+    const len = Math.hypot(dx, dy);
+    if (len > 1e-6) { tx = dx / len; ty = dy / len; }
+    const r = R(i);
+    L[i * 2] = q[i * 3] - ty * r; L[i * 2 + 1] = q[i * 3 + 1] + tx * r;
+    Rt[i * 2] = q[i * 3] + ty * r; Rt[i * 2 + 1] = q[i * 3 + 1] - tx * r;
+    // 急に曲がるところは輪郭が欠けやすいので、丸で補う
+    if (i > 0 && i < n - 1) {
+      const ux = q[i * 3] - q[a * 3], uy = q[i * 3 + 1] - q[a * 3 + 1];
+      const vx = q[b * 3] - q[i * 3], vy = q[b * 3 + 1] - q[i * 3 + 1];
+      const lu = Math.hypot(ux, uy), lv = Math.hypot(vx, vy);
+      if (lu > 1e-6 && lv > 1e-6 && (ux * vx + uy * vy) / (lu * lv) < 0.7) sharp.push(i);
+    }
+  }
+  ctx.beginPath();
+  ctx.moveTo(L[0], L[1]);
+  for (let i = 1; i < n; i++) ctx.lineTo(L[i * 2], L[i * 2 + 1]);
+  for (let i = n - 1; i >= 0; i--) ctx.lineTo(Rt[i * 2], Rt[i * 2 + 1]);
+  ctx.closePath();
+  ctx.fill();
+  // 両端は丸く
+  ctx.beginPath();
+  dot(0);
+  ctx.fill();
+  ctx.beginPath();
+  dot(n - 1);
+  for (const i of sharp) { ctx.moveTo(q[i * 3] + R(i), q[i * 3 + 1]); ctx.arc(q[i * 3], q[i * 3 + 1], R(i), 0, Math.PI * 2); }
+  ctx.fill();
 }
 
 // 矩形 [x0, y0, x1, y1] にかかる線を描く。蛍光ペンを先に描いて、文字の下に来るようにする。

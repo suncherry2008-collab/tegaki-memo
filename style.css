@@ -293,7 +293,7 @@ svg {
   align-items: center;
   justify-content: center;
   gap: 3px;
-  min-width: 64px;
+  min-width: 58px;
   height: 56px;
   padding: 0 8px;
   border: 0;
@@ -304,6 +304,7 @@ svg {
 }
 
 .tool svg { width: 24px; height: 24px; }
+.tool span, .btn-back { white-space: nowrap; }
 .tool:active { background: #E1E4E9; }
 
 .tool[aria-pressed="true"] {
@@ -449,6 +450,51 @@ svg {
   font-size: 16px;
   white-space: nowrap;
 }
+
+/* 選択(囲んで移動・削除) */
+.sel-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.sel-box {
+  position: absolute;
+  border: 1.5px dashed #5B6B82;
+  border-radius: 6px;
+  background: rgba(91, 107, 130, .06);
+}
+
+.sel-bar {
+  position: absolute;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 4px 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  box-shadow: 0 6px 20px rgba(31, 42, 58, .16);
+  font-size: 14px;
+  color: var(--muted);
+  pointer-events: auto;
+}
+
+.sel-bar button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px;
+  padding: 0 14px 0 10px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--bg);
+  color: #9A3A30;
+  font-size: 16px;
+}
+
+.sel-bar svg { width: 20px; height: 20px; }
 
 /* ---------- お知らせ ---------- */
 
@@ -794,7 +840,10 @@ svg {
 
 /* iPad mini 縦向きなど幅が狭いとき */
 @media (max-width: 760px) {
-  .tool { min-width: 56px; }
+  .tool { min-width: 46px; padding: 0 5px; font-size: 11px; }
+  .ed-bar { gap: 6px; padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); }
+  .ed-bar .btn-back { padding-right: 8px; }
+  .ed-bar .sep { margin: 0 2px; }
   .color, .mcolor, .width { width: 34px; }
   .palette { min-width: 204px; }
   .pg-date { font-size: 15px; }

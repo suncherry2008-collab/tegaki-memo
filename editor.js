@@ -1,7 +1,7 @@
 // 手書き画面(1ページ分)。どのページを表示するかは app.js が決める。
 //
 // 入力の扱い:
-//   Apple Pencil(pen)・マウス → 書く / 蛍光ペン / 消す / 囲む
+//   Apple Pencil(pen)・マウス → 書く / 蛍光ペン / 消す / 選択(囲んで移動・削除)/ 囲んでフラグ
 //   指1本                      → スクロール(慣性つき)
 //   指2本                      → ピンチで縮小・拡大(1ページ全体表示 〜 3倍)+移動
 //   スクロールとピンチはブラウザに任せず、すべてここで処理する(touch-action: none)。
@@ -54,7 +54,9 @@ export function createEditor(els, { onChange, onError }) {
   let dpr = 1;
   let sheetW = 0;
   let sheetH = 0;
-  let tool = 'pen';        // pen / marker / eraser / flag
+  let tool = 'pen';        // pen / marker / eraser / select / flag
+  let prevTool = 'pen';    // 消しゴムで消し終わったら戻る道具
+  let sel = null;          // 選択中の線 { strokes: [...] }
   let color = colorButtons[0].dataset.color;
   let markerColor = markerButtons[0].dataset.color;
   let penW = Number(widthButtons.find((b) => b.getAttribute('aria-pressed') === 'true').dataset.width);
@@ -81,6 +83,7 @@ export function createEditor(els, { onChange, onError }) {
     updateUndo();
     closePop();
     closeEraserMenu();
+    sel = null;
     clearTiles();
     if (!keepZoom) zoom = 1;
     layout({ px: 0, py: 0, vx: 0, vy: 0 });
@@ -91,6 +94,7 @@ export function createEditor(els, { onChange, onError }) {
     await flushSave();
     closePop();
     closeEraserMenu();
+    clearSelection();
     clearTiles();
     clearLive();
     page = null;
@@ -128,6 +132,7 @@ export function createEditor(els, { onChange, onError }) {
     }
     clearTiles();
     renderFlags();
+    renderSelection();
     if (anchor) {
       scroller.scrollLeft = sheet.offsetLeft + anchor.px * scale - anchor.vx;
       scroller.scrollTop = sheet.offsetTop + anchor.py * scale - anchor.vy;
@@ -246,7 +251,7 @@ export function createEditor(els, { onChange, onError }) {
     if (!page || action || pinch) return;
     if (e.pointerType === 'touch') return;                 // 指はスクロール・ピンチ用
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (e.target.closest('.flag-badge, .flag-pop')) return;
+    if (e.target.closest('.flag-badge, .flag-pop, .sel-bar')) return;
     e.preventDefault();
     closePop();
     closeEraserMenu();
@@ -273,15 +278,18 @@ export function createEditor(els, { onChange, onError }) {
       };
       if (marker) live.style.mixBlendMode = 'multiply'; // 書いている最中も文字が透けて見えるように
       armHold(action);
-      setTransform(liveCtx, action);
-      liveCtx.fillStyle = stroke.c;
-      liveCtx.beginPath();
-      liveCtx.arc(p.x, p.y, strokeWidth(stroke, p.p) / 2, 0, Math.PI * 2);
-      liveCtx.fill();
+      redrawLive(action);
     } else if (tool === 'eraser') {
       action = { ...a, kind: 'eraser', ops: [], last: p };
       eraseAlong(p, p);
       showEraser(p);
+    } else if (tool === 'select') {
+      if (sel && insideSelection(p)) {
+        startMove(a, p);
+      } else {
+        clearSelection();
+        action = { ...a, kind: 'lasso', pts: [p.x, p.y] };
+      }
     } else if (tool === 'flag') {
       action = { ...a, kind: 'flag', pts: [p.x, p.y] };
     }
@@ -298,11 +306,14 @@ export function createEditor(els, { onChange, onError }) {
       const p = toPage(ev, a);
       if (a.kind === 'pen') addPenPoint(smooth(a, p, ev.timeStamp));
       else if (a.kind === 'eraser') { eraseAlong(a.last, p); a.last = p; }
+      else if (a.kind === 'move') a.cur = p;
       else a.pts.push(p.x, p.y);
     }
-    if (a.kind === 'pen' && !a.straight) drawTail(a, e);
+    if (a.kind === 'pen' && !a.straight) { redrawLive(a); drawTail(a, e); }
     if (a.kind === 'eraser') showEraser(a.last);
-    if (a.kind === 'flag') drawLasso();
+    if (a.kind === 'flag') drawLasso('#C99A00');
+    if (a.kind === 'lasso') drawLasso('#5B6B82');
+    if (a.kind === 'move') drawMove(a);
   }
 
   function onPointerUp(e) {
@@ -314,11 +325,13 @@ export function createEditor(els, { onChange, onError }) {
     clearTimeout(a.holdTimer);
     penActive = false;
     lastPenAt = performance.now();
-    if (a.kind === 'pen') finishStroke(a.stroke);
-    else if (a.kind === 'eraser') finishErase(a);
-    else finishFlag(a);
     clearLive();
     live.style.mixBlendMode = '';
+    if (a.kind === 'pen') finishStroke(a.stroke);
+    else if (a.kind === 'eraser') { finishErase(a); setTool(prevTool); } // 消し終わったら前の道具に戻る
+    else if (a.kind === 'lasso') finishLasso(a);
+    else if (a.kind === 'move') finishMove(a);
+    else finishFlag(a);
   }
 
   // 手ぶれ補正:ゆっくり書くときは少しなめらかに、速く書くときはそのまま(遅れを出さない)
@@ -506,26 +519,11 @@ export function createEditor(els, { onChange, onError }) {
 
   // ---------- ペン・蛍光ペン ----------
 
-  // 最新の点 i が加わったときに、確定した区間(中間点から中間点まで)を描く。
-  // render.js の drawStroke と同じ曲線になるようにしている。
-  function drawLivePiece(s, i) {
-    const p = s.pts;
-    const mx = (k) => (p[k * 3] + p[k * 3 + 3]) / 2;
-    const my = (k) => (p[k * 3 + 1] + p[k * 3 + 4]) / 2;
-    liveCtx.strokeStyle = s.c;
-    liveCtx.lineCap = 'round';
-    liveCtx.lineJoin = 'round';
-    liveCtx.beginPath();
-    if (i === 1) {
-      liveCtx.lineWidth = strokeWidth(s, p[2]);
-      liveCtx.moveTo(p[0], p[1]);
-      liveCtx.lineTo(mx(0), my(0));
-    } else {
-      liveCtx.lineWidth = strokeWidth(s, p[(i - 1) * 3 + 2]);
-      liveCtx.moveTo(mx(i - 2), my(i - 2));
-      liveCtx.quadraticCurveTo(p[(i - 1) * 3], p[(i - 1) * 3 + 1], mx(i - 1), my(i - 1));
-    }
-    liveCtx.stroke();
+  // 書いている最中の線を描き直す。保存後と同じ drawStroke で描くので、ペンを離しても線の形が変わらない。
+  function redrawLive(a) {
+    clearCanvas(liveCtx, live);
+    setTransform(liveCtx, a);
+    drawStroke(liveCtx, a.stroke);
   }
 
   function addPenPoint(p) {
@@ -540,11 +538,9 @@ export function createEditor(els, { onChange, onError }) {
     if (Math.hypot(p.x - pts[n - 3], p.y - pts[n - 2]) < 0.35) return;
     const pr = a.stroke.hl ? 0.5 : pts[n - 1] * (1 - PRESSURE_SMOOTH) + p.p * PRESSURE_SMOOTH;
     pts.push(p.x, p.y, pr);
-    setTransform(liveCtx, a);
-    drawLivePiece(a.stroke, pts.length / 3 - 1);
   }
 
-  // まだ確定していない末尾(最後の中間点 → 最新の点 → 先読み位置)を仮に描く
+  // ペン先の少し先(先読み位置)まで仮に描き、ペンと線のずれを小さく見せる
   function drawTail(a, e) {
     const s = a.stroke;
     const p = s.pts;
@@ -558,8 +554,7 @@ export function createEditor(els, { onChange, onError }) {
     predCtx.lineJoin = 'round';
     predCtx.lineWidth = strokeWidth(s, p[n * 3 - 1]);
     predCtx.beginPath();
-    predCtx.moveTo((p[(n - 2) * 3] + p[(n - 1) * 3]) / 2, (p[(n - 2) * 3 + 1] + p[(n - 1) * 3 + 1]) / 2);
-    predCtx.lineTo(p[(n - 1) * 3], p[(n - 1) * 3 + 1]);
+    predCtx.moveTo(p[(n - 1) * 3], p[(n - 1) * 3 + 1]);
     const predicted = e.getPredictedEvents ? e.getPredictedEvents() : [];
     if (predicted.length) {
       for (const ev of predicted) {
@@ -767,11 +762,11 @@ export function createEditor(els, { onChange, onError }) {
 
   // ---------- あとで確認(囲んでフラグ) ----------
 
-  function drawLasso() {
+  function drawLasso(col) {
     const p = action.pts;
     clearCanvas(liveCtx, live);
     setTransform(liveCtx, action);
-    liveCtx.strokeStyle = '#C99A00';
+    liveCtx.strokeStyle = col;
     liveCtx.lineWidth = 2 / scale;
     liveCtx.setLineDash([8 / scale, 6 / scale]);
     liveCtx.beginPath();
@@ -874,6 +869,140 @@ export function createEditor(els, { onChange, onError }) {
     renderFlags();
   }
 
+  // ---------- 選択(囲んで移動・まとめて削除) ----------
+  // 選択を使って囲むと、囲みの中に半分以上入っている線が選ばれる(点線の枠で表示)。
+  // 枠の中をペンでなぞると移動、枠の上の「削除」でまとめて消える。枠の外をタップすると選択をやめる。
+
+  const selLayer = document.createElement('div');
+  selLayer.className = 'sel-layer';
+  sheet.appendChild(selLayer);
+
+  function inPolygon(x, y, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 2; i < poly.length; j = i, i += 2) {
+      const xi = poly[i], yi = poly[i + 1], xj = poly[j], yj = poly[j + 1];
+      if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+
+  function finishLasso(a) {
+    const poly = a.pts;
+    if (poly.length < 6) return;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (let i = 0; i < poly.length; i += 2) {
+      x0 = Math.min(x0, poly[i]); x1 = Math.max(x1, poly[i]);
+      y0 = Math.min(y0, poly[i + 1]); y1 = Math.max(y1, poly[i + 1]);
+    }
+    const picked = page.strokes.filter((s) => {
+      if (s.b[2] < x0 || s.b[0] > x1 || s.b[3] < y0 || s.b[1] > y1) return false;
+      let inn = 0, all = 0;
+      for (let i = 0; i < s.pts.length; i += 3) { all++; if (inPolygon(s.pts[i], s.pts[i + 1], poly)) inn++; }
+      return inn * 2 >= all;
+    });
+    if (!picked.length) return;
+    sel = { strokes: picked };
+    renderSelection();
+  }
+
+  function selRect() {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const s of sel.strokes) {
+      x0 = Math.min(x0, s.b[0]); y0 = Math.min(y0, s.b[1]);
+      x1 = Math.max(x1, s.b[2]); y1 = Math.max(y1, s.b[3]);
+    }
+    return [x0, y0, x1, y1];
+  }
+
+  function insideSelection(p) {
+    const [x0, y0, x1, y1] = selRect();
+    const pad = 12;
+    return p.x >= x0 - pad && p.x <= x1 + pad && p.y >= y0 - pad && p.y <= y1 + pad;
+  }
+
+  function renderSelection(dx = 0, dy = 0) {
+    selLayer.textContent = '';
+    if (!sel || !page) return;
+    const [x0, y0, x1, y1] = selRect();
+    const box = document.createElement('div');
+    box.className = 'sel-box';
+    box.style.cssText = `left:${(x0 + dx) * scale}px;top:${(y0 + dy) * scale}px;` +
+      `width:${(x1 - x0) * scale}px;height:${(y1 - y0) * scale}px`;
+    selLayer.appendChild(box);
+    if (dx || dy) return; // 移動中はボタンを出さない
+    const bar = document.createElement('div');
+    bar.className = 'sel-bar';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg>削除';
+    del.addEventListener('click', deleteSelection);
+    bar.appendChild(del);
+    const count = document.createElement('span');
+    count.textContent = `${sel.strokes.length}本`;
+    bar.prepend(count);
+    selLayer.appendChild(bar);
+    const top = y0 * scale - 60;
+    bar.style.left = Math.max(4, Math.min(x0 * scale, sheetW - 170)) + 'px';
+    bar.style.top = (top < 4 ? y1 * scale + 10 : top) + 'px';
+  }
+
+  function clearSelection() {
+    sel = null;
+    selLayer.textContent = '';
+  }
+
+  function deleteSelection() {
+    if (!sel) return;
+    const items = sel.strokes.map((s) => ({ s, index: page.strokes.indexOf(s) }))
+      .filter((x) => x.index >= 0).sort((a, b) => b.index - a.index);
+    const ops = [];
+    let rect = selRect();
+    for (const { s, index } of items) {
+      page.strokes.splice(index, 1);
+      ops.push({ index, removed: s, added: [] });
+    }
+    clearSelection();
+    rerenderRect(rect);
+    if (ops.length) { pushUndo({ type: 'erase', ops }); markDirty(); }
+  }
+
+  // 移動:選んだ線をいったんページから外して、ペンについてくる形で上に描く
+  function startMove(a, p) {
+    const moving = sel.strokes.map((s) => ({ s, index: page.strokes.indexOf(s) })).filter((x) => x.index >= 0);
+    for (const { index } of [...moving].sort((x, y) => y.index - x.index)) page.strokes.splice(index, 1);
+    rerenderRect(selRect());
+    action = { ...a, kind: 'move', start: p, cur: p, moving };
+    drawMove(action);
+  }
+
+  function drawMove(a) {
+    const dx = a.cur.x - a.start.x, dy = a.cur.y - a.start.y;
+    clearCanvas(liveCtx, live);
+    liveCtx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * (a.ox + dx * scale), dpr * (a.oy + dy * scale));
+    for (const pass of [true, false]) for (const { s } of a.moving) if (!!s.hl === pass) drawStroke(liveCtx, s);
+    renderSelection(dx, dy);
+  }
+
+  function shiftStroke(s, dx, dy) {
+    for (let i = 0; i < s.pts.length; i += 3) { s.pts[i] = r2(s.pts[i] + dx); s.pts[i + 1] = r2(s.pts[i + 1] + dy); }
+    s.b = [s.b[0] + dx, s.b[1] + dy, s.b[2] + dx, s.b[3] + dy].map(r2);
+  }
+
+  function finishMove(a) {
+    const dx = a.cur.x - a.start.x, dy = a.cur.y - a.start.y;
+    const before = selRect();
+    const moved = Math.hypot(dx, dy) >= 1;
+    if (moved) for (const { s } of a.moving) shiftStroke(s, dx, dy);
+    for (const { s, index } of [...a.moving].sort((x, y) => x.index - y.index)) {
+      page.strokes.splice(Math.min(index, page.strokes.length), 0, s);
+    }
+    const after = selRect();
+    rerenderRect(before);
+    rerenderRect(after);
+    renderSelection();
+    if (moved) { pushUndo({ type: 'move', strokes: a.moving.map((m) => m.s), dx, dy }); markDirty(); }
+  }
+
   // ---------- 道具・色・太さ ----------
 
   function setTool(t) {
@@ -881,11 +1010,16 @@ export function createEditor(els, { onChange, onError }) {
       if (eraserMenu.hidden) openEraserMenu(); else closeEraserMenu();
       return;
     }
+    if (t === 'eraser' && tool !== 'eraser') prevTool = tool === 'flag' ? 'pen' : tool;
+    if (t !== tool) clearSelection();
     tool = t;
     for (const b of toolButtons) b.setAttribute('aria-pressed', String(b.dataset.tool === t));
     // 左の「色・太さ」の枠は、最後に使ったペン(ペン/蛍光ペン)のものを表示する
     if (t === 'pen' || t === 'marker') toolbar.dataset.palette = t;
-    hint.hidden = t !== 'flag';
+    hint.hidden = t !== 'flag' && t !== 'select';
+    hint.textContent = t === 'select'
+      ? '動かしたい・消したい文字をペンで囲んでください'
+      : 'あとで確認したいところをペンで囲んでください';
     closePop();
     closeEraserMenu();
   }
@@ -928,6 +1062,7 @@ export function createEditor(els, { onChange, onError }) {
   function undo() {
     const u = undoStack.pop();
     if (!u || !page) return;
+    if (u.type === 'erase' || u.type === 'stroke') clearSelection();
     if (u.type === 'stroke') {
       const i = page.strokes.lastIndexOf(u.stroke);
       if (i >= 0) page.strokes.splice(i, 1);
@@ -941,6 +1076,14 @@ export function createEditor(els, { onChange, onError }) {
         }
         page.strokes.splice(Math.min(op.index, page.strokes.length), 0, op.removed);
         rerenderRect(op.removed.b);
+      }
+    } else if (u.type === 'move') {
+      clearSelection();
+      for (const st of u.strokes) {
+        const old = st.b.slice();
+        shiftStroke(st, -u.dx, -u.dy);
+        rerenderRect(old);
+        rerenderRect(st.b);
       }
     } else if (u.type === 'flag') {
       const i = page.flags.indexOf(u.flag);
